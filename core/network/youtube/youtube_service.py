@@ -15,7 +15,8 @@ class YoutubeService:
         "format": "bestaudio/best",
         "simulate": True,
         "skip_download": True,
-        "postprocessors": [{'key': 'FFmpegExtractAudio','preferredcodec': "mp3",'preferredquality': '192'}]
+        "postprocessors": [{'key': 'FFmpegExtractAudio','preferredcodec': "mp3",'preferredquality': '192'}],
+        'cookiefile': './cookies.txt'
     }
 
     @staticmethod
@@ -32,6 +33,7 @@ class YoutubeService:
         loop = asyncio.get_event_loop()
         try:
             with yt_dlp.YoutubeDL(YoutubeService.YDL_OPTIONS) as ytdl:
+                ytdl.cookiejar.load('./cookies.txt', ignore_discard=True, ignore_expires=True)
                 data = await loop.run_in_executor(
                     None,
                     lambda: ytdl.extract_info(url, download=False)
@@ -46,6 +48,7 @@ class YoutubeService:
         loop = asyncio.get_event_loop()
         try:
             with yt_dlp.YoutubeDL(YoutubeService.YDL_OPTIONS) as ytdl:
+                ytdl.cookiejar.load('./cookies.txt', ignore_discard=True, ignore_expires=True)
                 data = await loop.run_in_executor(
                     None,
                     lambda: ytdl.extract_info(f"ytsearch:{title}", download=False)
@@ -59,6 +62,7 @@ class YoutubeService:
         loop = asyncio.get_event_loop()
         try:
             with yt_dlp.YoutubeDL(YoutubeService.YDL_OPTIONS) as ytdl:
+                ytdl.cookiejar.load('./cookies.txt', ignore_discard=True, ignore_expires=True)
                 data = await loop.run_in_executor(
                     None,
                     lambda: ytdl.extract_info(playlist_url, download=False)

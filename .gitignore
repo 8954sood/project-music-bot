@@ -5,3 +5,4 @@ db.sqlite
 .idea
 __pycache__
 .idea/*
+cookies.txt
