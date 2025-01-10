@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Sequence, Union
 
 import discord
 from discord.ext import commands
-from discord import app_commands, Interaction, FFmpegPCMAudio, Embed, Attachment, File, AllowedMentions
+from discord import app_commands, Interaction, FFmpegPCMAudio, Embed, Attachment, File, AllowedMentions, VoiceState
 from discord.ext.commands import CommandError
 from discord.ui import View
 from discord.utils import MISSING
@@ -61,6 +61,31 @@ class Music(commands.Cog):
         else:
             if ctx.author.voice is None:
                 raise CommandError("음성 채널에 먼저 입장해주세요!")
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: VoiceState, after: VoiceState):
+        print(member.display_name)
+        # 이전 상태에 음성 채널이 있고, 이후 상태에서 채널이 None이면 나간 것
+        if before.channel is not None and after.channel is None and member.id == self.bot.user.id:
+            return await self.clear_guild_queue(member.guild.id)
+
+        # 유저가 채널 이동 또는 채널을 나간 경우
+        if before.channel is not None:
+            if (
+                    after.channel is not None and
+                    member.id == self.bot.user.id and
+                    sum(1 for member in after.channel.members if not member.bot) == 0
+            ):
+                return await self.clear_guild_queue(member.guild.id)
+
+            # 유저가 채널을 나갈 경우, 봇이 해당 채널에 있는지 확인 후 나가기.
+            join_member_list = before.channel.members
+            if (
+                    self.bot.user.id in list(map(lambda x: x.id, join_member_list)) and
+                    sum(1 for member in join_member_list if not member.bot) == 0
+            ):
+
+                return await self.clear_guild_queue(member.guild.id)
 
     async def play_music(self, guild_id: int):
         voice_model = self.music_queue[guild_id]
