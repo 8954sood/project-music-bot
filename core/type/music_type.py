@@ -14,4 +14,3 @@ class MusicType(TypedDict):
     now_playing: Optional[MusicApplication]
     queue: List[MusicApplication]
     loop: bool
-    is_playing: bool

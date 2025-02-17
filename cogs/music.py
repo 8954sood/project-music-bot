@@ -90,7 +90,6 @@ class Music(commands.Cog):
     async def play_music(self, guild_id: int):
         voice_model = self.music_queue[guild_id]
         if len(voice_model["queue"]) == 0:
-            voice_model["is_playing"] = False
             voice_model["now_playing"] = None
             message = await self.get_channel_message(guild_id)
             return await message.edit(
@@ -101,7 +100,6 @@ class Music(commands.Cog):
         music = voice_model["queue"].pop(0)
 
         source = FFmpegPCMAudio(music.youtube_search.audio_source, **FFMPEG_OPTIONS)
-        voice_model["is_playing"] = True
         voice_model["now_playing"] = music
         voice_model["vc"].play(
             source,
@@ -176,7 +174,7 @@ class Music(commands.Cog):
         self.check_voice_play(ctx)
         self.music_queue[ctx.guild.id]["vc"].pause()
 
-        if not self.music_queue[ctx.guild.id]["is_playing"]:
+        if not self.music_queue[ctx.guild.id]["vc"].is_playing():
             raise CommandError("현재 음악을 재생하고 있지 않아요")
 
         music = self.music_queue[ctx.guild.id]["now_playing"]
@@ -319,7 +317,6 @@ class Music(commands.Cog):
                 "volume": 1.0,
                 "queue": [],
                 "loop": False,
-                "is_playing": False,
             }
 
         guild_queue = self.music_queue[message.guild.id]
@@ -356,7 +353,7 @@ class Music(commands.Cog):
             guild_queue["queue"].append(youtube_play_list_to_music_application(search_result))
             await send_and_delete_message(f"{search_result.title} 곡을 추가했어요!")
 
-        if not guild_queue["is_playing"]:
+        if not guild_queue["vc"].is_playing():
             await self.play_music(message.guild.id)
         return await delete_message()
 

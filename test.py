@@ -26,8 +26,8 @@ async def main():
                 None,
                 lambda: ytdl.extract_info(f"ytsearch:멜론차트", download=False)
             )
-            # print(data)
-            print(ytdl.cookiejar.filename)
+            print(data)
+            # print(ytdl.cookiejar.filename)
     except (yt_dlp.utils.ExtractorError, yt_dlp.utils.DownloadError):
         return None
     # print(await YoutubeService.search("멜론차트"))
