@@ -99,7 +99,8 @@ if __name__ == "__main__":
             "https://youtube.com/playlist?list=PLg3uhUAs7P6o_mdJI3T2XZsGVTmn3g7g6&si=RAUs33iGEwQhKhmj",
             "https://www.youtube.com/watch?v=htALtC8nZiQ",
             "https://www.youtube.com/watch?v=mBXBOLG06Wc&list=PLg3uhUAs7P6o_mdJI3T2XZsGVTmn3g7g6&index=1",
-            "https://youtu.be/mBXBOLG06Wc?si=rOtXyr4ST31MJvzK"
+            "https://youtu.be/mBXBOLG06Wc?si=rOtXyr4ST31MJvzK",
+            "https://www.youtube.com/live/4Df04ViiX5U"
         ]
         for i in urls:
             print(await YoutubeService.search(i))
