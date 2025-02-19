@@ -78,6 +78,12 @@ class Music(commands.Cog):
             ):
                 return await self.clear_guild_queue(member.guild.id)
 
+            if (
+                member.id == self.bot.user.id and
+                after.channel is not None
+            ):
+                self.music_queue[member.guild.id]["voice_channel_id"] = after.channel.id
+
             # 유저가 채널을 나갈 경우, 봇이 해당 채널에 있는지 확인 후 나가기.
             join_member_list = before.channel.members
             if (
