@@ -127,6 +127,11 @@ class Music(commands.Cog):
         if self.music_queue.get(guild_id) is not None:
             self.music_queue[guild_id]["vc"].stop()
             await self.music_queue[guild_id]["vc"].disconnect()
+            await self.music_message_edit(
+                guild_id=guild_id,
+                embed=music_stop_embed(),
+                view=None,
+            )
         self.music_queue.pop(guild_id, None)
 
     async def music_message_edit(
@@ -329,20 +334,21 @@ class Music(commands.Cog):
         if message.author.voice.channel.id != guild_queue["voice_channel_id"]:
             return
 
-        search_result = await YoutubeService.search(message.content)
-
-        async def send_and_delete_message(content: str):
-            await message.channel.send(content, delete_after=5)
-
         async def delete_message():
             try:
                 await message.delete(delay=5)
             except:
                 pass
 
+        await delete_message()
+
+        search_result = await YoutubeService.search(message.content)
+
+        async def send_and_delete_message(content: str):
+            await message.channel.send(content, delete_after=5)
+
         if search_result is None:
             await send_and_delete_message("노래를 찾지 못했어요..")
-            return await delete_message()
 
         def youtube_play_list_to_music_application(play_list: YoutubeSearch) -> MusicApplication:
             return MusicApplication(
@@ -361,7 +367,6 @@ class Music(commands.Cog):
 
         if not guild_queue["vc"].is_playing():
             await self.play_music(message.guild.id)
-        return await delete_message()
 
 
 
