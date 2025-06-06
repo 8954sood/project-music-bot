@@ -64,33 +64,30 @@ class Music(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: VoiceState, after: VoiceState):
-        print(member.display_name)
-        # 이전 상태에 음성 채널이 있고, 이후 상태에서 채널이 None이면 나간 것
-        if before.channel is not None and after.channel is None and member.id == self.bot.user.id:
-            return await self.clear_guild_queue(member.guild.id)
-
-        # 유저가 채널 이동 또는 채널을 나간 경우
-        if before.channel is not None:
-            if (
-                    after.channel is not None and
-                    member.id == self.bot.user.id and
-                    sum(1 for member in after.channel.members if not member.bot) == 0
-            ):
+        # 봇이 음성 채널을 나갔을 경우
+        if member.id == self.bot.user.id:
+            if after.channel is None:
+                print("나가기1")
                 return await self.clear_guild_queue(member.guild.id)
 
-            if (
-                member.id == self.bot.user.id and
-                after.channel is not None
-            ):
-                self.music_queue[member.guild.id]["voice_channel_id"] = after.channel.id
+            # 유저 없는 채널로 이동한 경우
+            if sum(1 for m in after.channel.members if not m.bot) == 0:
+                print("나가기2")
+                return await self.clear_guild_queue(member.guild.id)
 
-            # 유저가 채널을 나갈 경우, 봇이 해당 채널에 있는지 확인 후 나가기.
+            # 봇의 채널 이동 처리
+            if after.channel is not None:
+                self.music_queue[member.guild.id]["voice_channel_id"] = after.channel.id
+            return
+
+        # 일반 유저가 채널을 나간 경우
+        if before.channel is not None:
             join_member_list = before.channel.members
             if (
-                    self.bot.user.id in list(map(lambda x: x.id, join_member_list)) and
-                    sum(1 for member in join_member_list if not member.bot) == 0
+                    self.bot.user.id in [m.id for m in join_member_list] and
+                    sum(1 for m in join_member_list if not m.bot) == 0
             ):
-
+                print("나가기3")
                 return await self.clear_guild_queue(member.guild.id)
 
     async def play_music(self, guild_id: int):
@@ -314,6 +311,7 @@ class Music(commands.Cog):
             return
 
         if self.music_queue.get(message.guild.id, None) is None:
+            print("나가기4")
             await self.clear_guild_queue(message.guild.id)
 
             if not message.guild.voice_client:
