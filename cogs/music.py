@@ -77,7 +77,9 @@ class Music(commands.Cog):
 
             # 봇의 채널 이동 처리
             if after.channel is not None:
-                self.music_queue[member.guild.id]["voice_channel_id"] = after.channel.id
+                queue = self.music_queue.get(member.guild.id)
+                if queue is not None:
+                    queue["voice_channel_id"] = after.channel.id
             return
 
         # 일반 유저가 채널을 나간 경우
