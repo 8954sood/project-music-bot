@@ -31,6 +31,46 @@ class Music(commands.Cog):
         self.guild_channel: Dict[int, MusicModel] = {}
         asyncio.run_coroutine_threadsafe(self.load_local_guild_channel(), self.bot.loop)
 
+    def build_queue_preview(self, queue: List[MusicApplication], max_items: int = 5) -> Optional[str]:
+        if not queue:
+            return None
+        lines = [f"{idx + 1}. {item.youtube_search.title}" for idx, item in enumerate(queue[:max_items])]
+        if len(queue) > max_items:
+            lines.append(f"... and {len(queue) - max_items} more")
+        return "\n".join(lines)
+
+    async def refresh_now_playing_embed(self, guild_id: int, *, is_paused: bool = False):
+        voice_model = self.music_queue.get(guild_id)
+        if voice_model is None:
+            return
+        music = voice_model.get("now_playing")
+        if music is None:
+            return
+        if is_paused:
+            embed = music_pause_embed(
+                user_name=music.user_name,
+                user_icon=music.user_icon,
+                music_title=music.youtube_search.title,
+                music_thumbnail=music.youtube_search.thumbnail_url,
+                music_url=music.youtube_search.video_url,
+            )
+        else:
+            embed = music_play_embed(
+                user_name=music.user_name,
+                user_icon=music.user_icon,
+                music_title=music.youtube_search.title,
+                music_thumbnail=music.youtube_search.thumbnail_url,
+                music_url=music.youtube_search.video_url,
+            )
+        queue_preview = self.build_queue_preview(voice_model["queue"])
+        if queue_preview:
+            embed.add_field(name="Up next", value=queue_preview, inline=False)
+        await self.music_message_edit(
+            guild_id=guild_id,
+            embed=embed,
+            view=get_music_view(is_paused=is_paused)
+        )
+
     async def load_local_guild_channel(self):
         local_default_channels = await MusicDataSource.get_all()
         for i in local_default_channels:
@@ -110,17 +150,7 @@ class Music(commands.Cog):
             source,
             after=lambda e: asyncio.run_coroutine_threadsafe(self.play_music(guild_id), self.bot.loop),
         )
-        await self.music_message_edit(
-            guild_id=guild_id,
-            embed=music_play_embed(
-                user_name=music.user_name,
-                user_icon=music.user_icon,
-                music_title=music.youtube_search.title,
-                music_url=music.youtube_search.video_url,
-                music_thumbnail=music.youtube_search.thumbnail_url
-            ),
-            view=get_music_view()
-        )
+        await self.refresh_now_playing_embed(guild_id, is_paused=False)
 
     async def clear_guild_queue(self, guild_id: int):
         if self.music_queue.get(guild_id) is not None:
@@ -187,34 +217,12 @@ class Music(commands.Cog):
         if not self.music_queue[ctx.guild.id]["vc"].is_playing():
             raise CommandError("현재 음악을 재생하고 있지 않아요")
 
-        music = self.music_queue[ctx.guild.id]["now_playing"]
-        await self.music_message_edit(
-            guild_id=ctx.guild.id,
-            embed=music_pause_embed(
-                user_name=music.user_name,
-                user_icon=music.user_icon,
-                music_title=music.youtube_search.title,
-                music_thumbnail=music.youtube_search.thumbnail_url,
-                music_url=music.youtube_search.video_url,
-            ),
-            view=get_music_view(is_paused=True)
-        )
+        await self.refresh_now_playing_embed(ctx.guild.id, is_paused=True)
 
     async def _resume(self, ctx: commands.Context | Interaction):
         self.check_voice_play(ctx)
         self.music_queue[ctx.guild.id]["vc"].resume()
-        music = self.music_queue[ctx.guild.id]["now_playing"]
-        await self.music_message_edit(
-            guild_id=ctx.guild.id,
-            embed=music_play_embed(
-                user_name=music.user_name,
-                user_icon=music.user_icon,
-                music_title=music.youtube_search.title,
-                music_thumbnail=music.youtube_search.thumbnail_url,
-                music_url=music.youtube_search.video_url,
-            ),
-            view=get_music_view(),
-        )
+        await self.refresh_now_playing_embed(ctx.guild.id, is_paused=False)
 
     async def _stop(self, ctx: commands.Context | Interaction):
         self.check_voice_play(ctx)
@@ -367,6 +375,11 @@ class Music(commands.Cog):
 
         if not guild_queue["vc"].is_playing():
             await self.play_music(message.guild.id)
+        else:
+            await self.refresh_now_playing_embed(
+                message.guild.id,
+                is_paused=guild_queue["vc"].is_paused()
+            )
 
 
 
