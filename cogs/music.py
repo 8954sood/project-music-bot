@@ -9,6 +9,7 @@ from discord.ext.commands import CommandError
 from discord.ui import View
 from discord.utils import MISSING
 
+from core.util import log_event
 from core.local.music import MusicDataSource
 from core.local.music.model import MusicModel
 from core.model.music_application import MusicApplication
@@ -78,8 +79,8 @@ class Music(commands.Cog):
         local_default_channels = await MusicDataSource.get_all()
         for i in local_default_channels:
             self.guild_channel[i.guild_id] = i
-        print("로컬에서 Music 채널 불러옴.")
-        print(self.guild_channel)
+        log_event("로컬에서 Music 채널 불러옴.")
+        log_event(f"guild_channel={self.guild_channel}")
 
     def guild_channel_ids(self) -> List[int]:
         return [model.channel_id for model in self.guild_channel.values()]
@@ -120,12 +121,12 @@ class Music(commands.Cog):
         # 봇이 음성 채널을 나갔을 경우
         if member.id == self.bot.user.id:
             if after.channel is None:
-                print("나가기1")
+                log_event("나가기1")
                 return await self.clear_guild_queue(member.guild.id)
 
             # 유저 없는 채널로 이동한 경우
             if sum(1 for m in after.channel.members if not m.bot) == 0:
-                print("나가기2")
+                log_event("나가기2")
                 return await self.clear_guild_queue(member.guild.id)
 
             # 봇의 채널 이동 처리
@@ -142,7 +143,7 @@ class Music(commands.Cog):
                     self.bot.user.id in [m.id for m in join_member_list] and
                     sum(1 for m in join_member_list if not m.bot) == 0
             ):
-                print("나가기3")
+                log_event("나가기3")
                 return await self.clear_guild_queue(member.guild.id)
 
     async def play_music(
@@ -165,7 +166,7 @@ class Music(commands.Cog):
 
         music = voice_model["queue"].pop(0)
         source = FFmpegPCMAudio(music.youtube_search.audio_source, **FFMPEG_OPTIONS)
-        print("[PLAY_MUSIC] : " + music.youtube_search.audio_source)
+        log_event(music.youtube_search.audio_source)
         voice_model["now_playing"] = music
         voice_model["vc"].play(
             source,
@@ -306,7 +307,7 @@ class Music(commands.Cog):
         try:
             if interaction.client.user.id != self.bot.user.id and interaction.type != discord.InteractionType.component:
                 return
-            print(interaction.message)
+            log_event(interaction.message)
             async def send_and_delete_message(content: str):
                 await interaction.response.send_message(content, delete_after=5)
 
@@ -371,7 +372,7 @@ class Music(commands.Cog):
             return
 
         if self.music_queue.get(message.guild.id, None) is None:
-            print("나가기4")
+            log_event("나가기4")
             await self.clear_guild_queue(message.guild.id)
 
             if not message.guild.voice_client:
