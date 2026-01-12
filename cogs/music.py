@@ -163,8 +163,9 @@ class Music(commands.Cog):
         music = voice_model["queue"].pop(0)
         if voice_model.get("loop"):
             voice_model["queue"].append(music)
-
+    
         source = FFmpegPCMAudio(music.youtube_search.audio_source, **FFMPEG_OPTIONS)
+        print("[PLAY_MUSIC] : " + music.youtube_search.audio_source)
         voice_model["now_playing"] = music
         voice_model["vc"].play(
             source,

@@ -12,10 +12,10 @@ class YoutubeService:
 
     YDL_OPTIONS = {
         'quiet': not IS_DEBUG,
-        "format": "bestaudio/best",
-        "simulate": True,
+        "format": "bestaudio[protocol=https]/bestaudio[protocol!=m3u8_native]/bestaudio/best",#"bestaudio/best",
+        #"simulate": True,
         "skip_download": True,
-        "postprocessors": [{'key': 'FFmpegExtractAudio','preferredcodec': "mp3",'preferredquality': '192'}],
+        #"postprocessors": [{'key': 'FFmpegExtractAudio','preferredcodec': "mp3",'preferredquality': '192'}],
         'cookiefile': './cookies.txt'
     }
 
