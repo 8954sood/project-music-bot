@@ -1,4 +1,5 @@
 import asyncio
+import random
 from typing import Dict, List, Optional, Sequence, Union
 
 import discord
@@ -36,7 +37,7 @@ class Music(commands.Cog):
             return None
         lines = [f"{idx + 1}. {item.youtube_search.title}" for idx, item in enumerate(queue[:max_items])]
         if len(queue) > max_items:
-            lines.append(f"... and {len(queue) - max_items} more")
+            lines.append(f"... 외 {len(queue) - max_items}곡")
         return "\n".join(lines)
 
     async def refresh_now_playing_embed(self, guild_id: int, *, is_paused: bool = False):
@@ -62,13 +63,20 @@ class Music(commands.Cog):
                 music_thumbnail=music.youtube_search.thumbnail_url,
                 music_url=music.youtube_search.video_url,
             )
+        loop_status = "켜짐" if voice_model.get("loop") else "꺼짐"
+        play_status = "일시정지" if is_paused else "재생중"
+        embed.add_field(
+            name="상태",
+            value=f"재생: {play_status}\n반복: {loop_status}\n대기열: {len(voice_model['queue'])}곡",
+            inline=False
+        )
         queue_preview = self.build_queue_preview(voice_model["queue"])
         if queue_preview:
-            embed.add_field(name="Up next", value=queue_preview, inline=False)
+            embed.add_field(name="대기열", value=queue_preview, inline=False)
         await self.music_message_edit(
             guild_id=guild_id,
             embed=embed,
-            view=get_music_view(is_paused=is_paused)
+            view=get_music_view(is_paused=is_paused, loop_enabled=voice_model.get("loop", False))
         )
 
     async def load_local_guild_channel(self):
@@ -101,6 +109,16 @@ class Music(commands.Cog):
         else:
             if ctx.author.voice is None:
                 raise CommandError("음성 채널에 먼저 입장해주세요!")
+
+    @commands.command("반복", aliases=["loop"])
+    async def loop(self, ctx: commands.Context):
+        message = await self._loop(ctx)
+        await ctx.send(message)
+
+    @commands.command("셔플", aliases=["shuffle"])
+    async def shuffle(self, ctx: commands.Context):
+        message = await self._shuffle(ctx)
+        await ctx.send(message)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: VoiceState, after: VoiceState):
@@ -143,6 +161,8 @@ class Music(commands.Cog):
             )
 
         music = voice_model["queue"].pop(0)
+        if voice_model.get("loop"):
+            voice_model["queue"].append(music)
 
         source = FFmpegPCMAudio(music.youtube_search.audio_source, **FFMPEG_OPTIONS)
         voice_model["now_playing"] = music
@@ -232,6 +252,29 @@ class Music(commands.Cog):
         self.check_voice_play(ctx)
         self.music_queue[ctx.guild.id]["vc"].stop()
 
+    async def _loop(self, ctx: commands.Context | Interaction) -> str:
+        self.check_voice_play(ctx)
+        guild_queue = self.music_queue[ctx.guild.id]
+        guild_queue["loop"] = not guild_queue["loop"]
+        await self.refresh_now_playing_embed(
+            ctx.guild.id,
+            is_paused=guild_queue["vc"].is_paused()
+        )
+        state = "켜짐" if guild_queue["loop"] else "꺼짐"
+        return f"반복을 {state}으로 설정했어요."
+
+    async def _shuffle(self, ctx: commands.Context | Interaction) -> str:
+        self.check_voice_play(ctx)
+        guild_queue = self.music_queue[ctx.guild.id]
+        if len(guild_queue["queue"]) < 2:
+            raise CommandError("셔플할 곡이 부족해요.")
+        random.shuffle(guild_queue["queue"])
+        await self.refresh_now_playing_embed(
+            ctx.guild.id,
+            is_paused=guild_queue["vc"].is_paused()
+        )
+        return "대기열을 섞었어요."
+
     @app_commands.command(name="채널설정")
     async def set_channel(self, interaction: Interaction, channel: discord.TextChannel):
         message = await channel.send(embed=music_stop_embed())
@@ -279,6 +322,12 @@ class Music(commands.Cog):
             elif custom_id == "skip":
                 await self._skip(interaction)
                 return await send_and_delete_message("음악 재생을 넘겼어요")
+            elif custom_id == "loop":
+                message = await self._loop(interaction)
+                return await send_and_delete_message(message)
+            elif custom_id == "shuffle":
+                message = await self._shuffle(interaction)
+                return await send_and_delete_message(message)
 
 
 
