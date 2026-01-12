@@ -54,6 +54,7 @@ class Music(commands.Cog):
                 music_title=music.youtube_search.title,
                 music_thumbnail=music.youtube_search.thumbnail_url,
                 music_url=music.youtube_search.video_url,
+                isLoop=voice_model.get("loop"),
             )
         else:
             embed = music_play_embed(
@@ -62,14 +63,8 @@ class Music(commands.Cog):
                 music_title=music.youtube_search.title,
                 music_thumbnail=music.youtube_search.thumbnail_url,
                 music_url=music.youtube_search.video_url,
+                isLoop=voice_model.get("loop"),
             )
-        loop_status = "켜짐" if voice_model.get("loop") else "꺼짐"
-        play_status = "일시정지" if is_paused else "재생중"
-        embed.add_field(
-            name="상태",
-            value=f"재생: {play_status}\n반복: {loop_status}\n대기열: {len(voice_model['queue'])}곡",
-            inline=False
-        )
         queue_preview = self.build_queue_preview(voice_model["queue"])
         if queue_preview:
             embed.add_field(name="대기열", value=queue_preview, inline=False)
@@ -150,8 +145,16 @@ class Music(commands.Cog):
                 print("나가기3")
                 return await self.clear_guild_queue(member.guild.id)
 
-    async def play_music(self, guild_id: int):
+    async def play_music(
+        self,
+        guild_id: int, 
+        beforeMusic: Optional[MusicApplication] = None,
+    ):
         voice_model = self.music_queue[guild_id]
+        
+        if voice_model["loop"] and beforeMusic != None:
+            voice_model["queue"].append(beforeMusic)
+
         if len(voice_model["queue"]) == 0:
             voice_model["now_playing"] = None
             message = await self.get_channel_message(guild_id)
@@ -161,15 +164,12 @@ class Music(commands.Cog):
             )
 
         music = voice_model["queue"].pop(0)
-        if voice_model.get("loop"):
-            voice_model["queue"].append(music)
-    
         source = FFmpegPCMAudio(music.youtube_search.audio_source, **FFMPEG_OPTIONS)
         print("[PLAY_MUSIC] : " + music.youtube_search.audio_source)
         voice_model["now_playing"] = music
         voice_model["vc"].play(
             source,
-            after=lambda e: asyncio.run_coroutine_threadsafe(self.play_music(guild_id), self.bot.loop),
+            after=lambda e: asyncio.run_coroutine_threadsafe(self.play_music(guild_id, music), self.bot.loop),
         )
         await self.refresh_now_playing_embed(guild_id, is_paused=False)
 
@@ -233,11 +233,11 @@ class Music(commands.Cog):
 
     async def _pause(self, ctx: commands.Context | Interaction):
         self.check_voice_play(ctx)
-        self.music_queue[ctx.guild.id]["vc"].pause()
 
         if not self.music_queue[ctx.guild.id]["vc"].is_playing():
             raise CommandError("현재 음악을 재생하고 있지 않아요")
-
+        
+        self.music_queue[ctx.guild.id]["vc"].pause()
         await self.refresh_now_playing_embed(ctx.guild.id, is_paused=True)
 
     async def _resume(self, ctx: commands.Context | Interaction):
