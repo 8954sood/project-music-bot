@@ -85,9 +85,34 @@ class Music(commands.Cog):
     def guild_channel_ids(self) -> List[int]:
         return [model.channel_id for model in self.guild_channel.values()]
 
-    async def get_channel_message(self, guild_id: int) -> discord.Message:
+    async def get_channel_message(self, guild_id: int) -> Optional[discord.Message]:
         music_model = self.guild_channel.get(guild_id, None)
-        return await (await self.bot.fetch_channel(music_model.channel_id)).fetch_message(music_model.message_id)
+        if music_model is None:
+            return None
+        
+        retry_delays = [1, 2, 3]
+        last_error = None
+        for attempt, delay in enumerate(retry_delays, start=1):
+            try:
+                channel = await self.bot.fetch_channel(music_model.channel_id)
+                return await channel.fetch_message(music_model.message_id)
+            except discord.NotFound:
+                raise
+            except discord.Forbidden:
+                raise
+            except discord.HTTPException as exc:
+                last_error = exc
+                if getattr(exc, "status", None) is not None and exc.status < 500:
+                    raise
+                log_event(f"get_channel_message retry {attempt}/3 failed: {exc}")
+            except (discord.DiscordServerError, asyncio.TimeoutError, OSError, ConnectionResetError) as exc:
+                last_error = exc
+                log_event(f"get_channel_message retry {attempt}/3 failed: {exc}")
+            if attempt < len(retry_delays):
+                await asyncio.sleep(delay)
+
+        log_event(f"get_channel_message failed after retries: {last_error}")
+        return None
 
 
     def check_voice_play(self, ctx: commands.Context | Interaction):
@@ -158,11 +183,12 @@ class Music(commands.Cog):
 
         if len(voice_model["queue"]) == 0:
             voice_model["now_playing"] = None
-            message = await self.get_channel_message(guild_id)
-            return await message.edit(
+            await self.music_message_edit(
+                guild_id=guild_id,
                 embed=music_stop_embed(),
                 view=None
             )
+            return
 
         music = voice_model["queue"].pop(0)
         source = FFmpegPCMAudio(music.youtube_search.audio_source, **FFMPEG_OPTIONS)
@@ -200,6 +226,9 @@ class Music(commands.Cog):
     ):
         try:
             message = await self.get_channel_message(guild_id)
+            if message is None:
+                log_event("music_message_edit aborted: channel/message fetch failed")
+                return
             await message.edit(
                 content=content,
                 embed=embed,
@@ -305,7 +334,9 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_interaction(self, interaction: Interaction):
         try:
-            if interaction.client.user.id != self.bot.user.id and interaction.type != discord.InteractionType.component:
+            if (interaction.client.user.id != self.bot.user.id 
+                or interaction.type != discord.InteractionType.component 
+                or interaction.data.get("custom_id", None) is None):
                 return
             log_event(interaction.message)
             async def send_and_delete_message(content: str):
@@ -408,6 +439,7 @@ class Music(commands.Cog):
 
         if search_result is None:
             await send_and_delete_message("노래를 찾지 못했어요..")
+            return
 
         def youtube_play_list_to_music_application(play_list: YoutubeSearch) -> MusicApplication:
             return MusicApplication(
