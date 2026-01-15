@@ -85,6 +85,31 @@ class Music(commands.Cog):
     def guild_channel_ids(self) -> List[int]:
         return [model.channel_id for model in self.guild_channel.values()]
 
+    async def ensure_voice_model(self, message: discord.Message) -> MusicType:
+        guild_id = message.guild.id
+        voice_model = self.music_queue.get(guild_id)
+        vc = message.guild.voice_client
+
+        if voice_model is None or vc is None or not vc.is_connected():
+            if voice_model is not None:
+                try:
+                    voice_model["vc"].stop()
+                    await voice_model["vc"].disconnect()
+                except Exception:
+                    pass
+            vc = await message.author.voice.channel.connect()
+            voice_model = {
+                "guild_id": guild_id,
+                "voice_channel_id": message.author.voice.channel.id,
+                "vc": vc,
+                "volume": 1.0,
+                "queue": [],
+                "loop": False,
+            }
+            self.music_queue[guild_id] = voice_model
+
+        return voice_model
+
     async def get_channel_message(self, guild_id: int) -> Optional[discord.Message]:
         music_model = self.guild_channel.get(guild_id, None)
         if music_model is None:
@@ -402,25 +427,7 @@ class Music(commands.Cog):
         if message.author.voice is None:
             return
 
-        if self.music_queue.get(message.guild.id, None) is None:
-            log_event("나가기4")
-            await self.clear_guild_queue(message.guild.id)
-
-            if not message.guild.voice_client:
-                vc = await message.author.voice.channel.connect()
-            else:
-                vc = message.guild.voice_client
-
-            self.music_queue[message.guild.id] = {
-                "guild_id": message.guild.id,
-                "voice_channel_id": message.author.voice.channel.id,
-                "vc": vc,
-                "volume": 1.0,
-                "queue": [],
-                "loop": False,
-            }
-
-        guild_queue = self.music_queue[message.guild.id]
+        guild_queue = await self.ensure_voice_model(message)
         if message.author.voice.channel.id != guild_queue["voice_channel_id"]:
             return
 
