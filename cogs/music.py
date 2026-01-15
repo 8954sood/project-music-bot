@@ -23,6 +23,7 @@ FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn'
 }
+MAX_GUILD_ACTION_PENDING = 5
 
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -31,6 +32,8 @@ class Music(commands.Cog):
         self.music_queue: Dict[int, MusicType] = {}
         # key: guild_id, Value: channel_id
         self.guild_channel: Dict[int, MusicModel] = {}
+        # Key: guild_id, Value: {"lock": asyncio.Lock, "pending": int}
+        self.guild_action_state: Dict[int, Dict[str, object]] = {}
         asyncio.run_coroutine_threadsafe(self.load_local_guild_channel(), self.bot.loop)
 
     def build_queue_preview(self, queue: List[MusicApplication], max_items: int = 5) -> Optional[str]:
@@ -84,6 +87,75 @@ class Music(commands.Cog):
 
     def guild_channel_ids(self) -> List[int]:
         return [model.channel_id for model in self.guild_channel.values()]
+
+    def _get_action_state(self, guild_id: int) -> Dict[str, object]:
+        state = self.guild_action_state.get(guild_id)
+        if state is None:
+            state = {"lock": asyncio.Lock(), "pending": 0}
+            self.guild_action_state[guild_id] = state
+        return state
+
+    async def _send_action_message(
+        self,
+        ctx: commands.Context | Interaction,
+        content: str,
+        *,
+        delete_after: float = 5,
+        ephemeral: bool = False,
+    ):
+        if isinstance(ctx, Interaction):
+            if ctx.response.is_done():
+                message = await ctx.followup.send(content, ephemeral=ephemeral)
+                if delete_after and not ephemeral:
+                    async def delete_later():
+                        try:
+                            await asyncio.sleep(delete_after)
+                            await message.delete()
+                        except Exception:
+                            pass
+                    asyncio.create_task(delete_later())
+            else:
+                await ctx.response.send_message(content, delete_after=delete_after, ephemeral=ephemeral)
+        else:
+            await ctx.send(content, delete_after=delete_after)
+
+    async def _run_serialized_action(
+        self,
+        ctx: commands.Context | Interaction,
+        action_coro,
+        *,
+        success_message: str,
+    ):
+        state = self._get_action_state(ctx.guild.id)
+        pending = state["pending"]
+        if isinstance(pending, int) and pending >= MAX_GUILD_ACTION_PENDING:
+            await self._send_action_message(
+                ctx,
+                "요청이 너무 많아 잠시 후 다시 시도해 주세요.",
+                ephemeral=isinstance(ctx, Interaction),
+            )
+            return
+
+        if isinstance(ctx, Interaction) and not ctx.response.is_done() and pending:
+            await ctx.response.defer()
+
+        state["pending"] = pending + 1 if isinstance(pending, int) else 1
+        try:
+            lock = state["lock"]
+            if not isinstance(lock, asyncio.Lock):
+                lock = asyncio.Lock()
+                state["lock"] = lock
+            async with lock:
+                await action_coro()
+            await self._send_action_message(ctx, success_message)
+        except CommandError as exc:
+            await self._send_action_message(
+                ctx,
+                exc.args[0],
+                ephemeral=isinstance(ctx, Interaction),
+            )
+        finally:
+            state["pending"] = max((state["pending"] or 1) - 1, 0)
 
     async def ensure_voice_model(self, message: discord.Message) -> MusicType:
         guild_id = message.guild.id
@@ -364,35 +436,52 @@ class Music(commands.Cog):
                 or interaction.data.get("custom_id", None) is None):
                 return
             log_event(interaction.message)
-            async def send_and_delete_message(content: str):
-                await interaction.response.send_message(content, delete_after=5)
 
             custom_id = interaction.data["custom_id"]
             if custom_id == "stop":
-                await self._stop(interaction)
-                return await send_and_delete_message("음악 재생을 초기화했어요")
+                return await self._run_serialized_action(
+                    interaction,
+                    lambda: self._stop(interaction),
+                    success_message="음악 재생을 초기화했어요",
+                )
             elif custom_id == "pause":
                 await self._pause(interaction)
-                return await send_and_delete_message("음악 재생을 일시정지 했어요")
+                return await self._send_action_message(
+                    interaction,
+                    "음악 재생을 일시정지 했어요",
+                )
             elif custom_id == "resume":
                 await self._resume(interaction)
-                return await send_and_delete_message("음악 재생을 재개 했어요")
+                return await self._send_action_message(
+                    interaction,
+                    "음악 재생을 재개 했어요",
+                )
             elif custom_id == "skip":
-                await self._skip(interaction)
-                return await send_and_delete_message("음악 재생을 넘겼어요")
+                return await self._run_serialized_action(
+                    interaction,
+                    lambda: self._skip(interaction),
+                    success_message="음악 재생을 넘겼어요",
+                )
             elif custom_id == "loop":
                 message = await self._loop(interaction)
-                return await send_and_delete_message(message)
+                return await self._send_action_message(interaction, message)
             elif custom_id == "shuffle":
                 message = await self._shuffle(interaction)
-                return await send_and_delete_message(message)
+                return await self._send_action_message(interaction, message)
 
 
 
-            await interaction.response.send_message(f"{interaction.data['custom_id']} 버튼이 클릭되었습니다!")
+            await self._send_action_message(
+                interaction,
+                f"{interaction.data['custom_id']} 버튼이 클릭되었습니다!",
+            )
         except Exception as exception:
             if isinstance(exception, CommandError):
-                return await interaction.response.send_message(f"{exception.args[0]}", ephemeral=True)
+                return await self._send_action_message(
+                    interaction,
+                    f"{exception.args[0]}",
+                    ephemeral=True,
+                )
             raise exception
 
     @commands.command("일시정지")
@@ -407,13 +496,19 @@ class Music(commands.Cog):
 
     @commands.command("정지")
     async def stop(self, ctx: commands.Context):
-        await self._stop(ctx)
-        await ctx.send("음악 재생을 초기화했어요")
+        await self._run_serialized_action(
+            ctx,
+            lambda: self._stop(ctx),
+            success_message="음악 재생을 초기화했어요",
+        )
 
     @commands.command("스킵")
     async def skip(self, ctx: commands.Context):
-        await self._skip(ctx)
-        await ctx.send("음악 재생을 넘겼어요")
+        await self._run_serialized_action(
+            ctx,
+            lambda: self._skip(ctx),
+            success_message="음악 재생을 넘겼어요",
+        )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
