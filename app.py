@@ -44,6 +44,39 @@ async def on_ready():
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
     print('------')
 
+@bot.command("reload")
+@commands.is_owner()
+async def reload_cog(ctx, cog: str = "all"):
+    if cog == "all":
+        loaded = []
+        failed = []
+        for filename in os.listdir("./cogs"):
+            if not filename.endswith(".py") or filename == "__init__.py":
+                continue
+            name = f'cogs.{filename.lower()[:-3]}'
+            try:
+                if name in bot.extensions:
+                    await bot.reload_extension(name)
+                else:
+                    await bot.load_extension(name)
+                loaded.append(filename)
+            except Exception as exc:
+                failed.append((filename, str(exc)))
+        await ctx.send(f"reloaded: {', '.join(loaded) if loaded else 'none'}")
+        if failed:
+            await ctx.send("failed: " + ", ".join([f"{f} ({e})" for f, e in failed]))
+        return
+
+    name = f'cogs.{cog.lower()}'
+    try:
+        if name in bot.extensions:
+            await bot.reload_extension(name)
+        else:
+            await bot.load_extension(name)
+        await ctx.send(f"reloaded: {cog}")
+    except Exception as exc:
+        await ctx.send(f"reload failed: {cog} ({exc})")
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):

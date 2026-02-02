@@ -1,39 +1,34 @@
 import asyncio
-import random
 from typing import Dict, List, Optional, Sequence, Union
 
 import discord
 from discord.ext import commands
-from discord import app_commands, Interaction, FFmpegPCMAudio, Embed, Attachment, File, AllowedMentions, VoiceState
+from discord import app_commands, Interaction, Embed, Attachment, File, AllowedMentions, VoiceState
 from discord.ext.commands import CommandError
 from discord.ui import View
 from discord.utils import MISSING
 
+from core.audio import create_audio_service
 from core.util import log_event
 from core.local.music import MusicDataSource
 from core.local.music.model import MusicModel
 from core.model.music_application import MusicApplication
 from core.network import YoutubePlaylist, YoutubeSearch
 from core.network.youtube.youtube_service import YoutubeService
-from core.type import MusicType
 from embeds.music_embed import music_play_embed, music_pause_embed, music_stop_embed
 from views import get_music_view
-
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
-}
 MAX_GUILD_ACTION_PENDING = 5
 
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Key: guild_id, Value: MusicType
-        self.music_queue: Dict[int, MusicType] = {}
         # key: guild_id, Value: channel_id
         self.guild_channel: Dict[int, MusicModel] = {}
         # Key: guild_id, Value: {"lock": asyncio.Lock, "pending": int}
         self.guild_action_state: Dict[int, Dict[str, object]] = {}
+        self.audio_service = create_audio_service(bot)
+        self.audio_service.on_track_start = self._on_track_start
+        self.audio_service.on_queue_empty = self._on_queue_empty
         asyncio.run_coroutine_threadsafe(self.load_local_guild_channel(), self.bot.loop)
 
     def build_queue_preview(self, queue: List[MusicApplication], max_items: int = 5) -> Optional[str]:
@@ -44,13 +39,109 @@ class Music(commands.Cog):
             lines.append(f"... 외 {len(queue) - max_items}곡")
         return "\n".join(lines)
 
+    async def _search_tracks_ytdlp(self, query: str, requester: discord.abc.User):
+        search_result = await YoutubeService.search(query)
+        if search_result is None:
+            return [], None, None
+
+        def to_app(item: YoutubeSearch) -> MusicApplication:
+            return MusicApplication(
+                youtube_search=item,
+                user_id=requester.id,
+                user_name=requester.name,
+                user_icon=requester.display_avatar.url,
+            )
+
+        if isinstance(search_result, YoutubePlaylist):
+            tracks = [to_app(x) for x in search_result.songs]
+            return tracks, search_result.title, search_result.song_cnt
+
+        return [to_app(search_result)], None, None
+
+    async def _search_tracks_lavalink(
+        self, query: str, requester: discord.abc.User, limit: Optional[int] = None
+    ):
+        backend = self.audio_service.backend
+        if not hasattr(backend, "_node") or backend._node is None:
+            log_event("lavalink search skipped: backend._node is None")
+            return [], None, None
+
+        from core.network.youtube.internal.youtube_utile import is_youtube_url
+
+        lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
+        log_event(f"lavalink search query={lavalink_query}")
+        results = await backend._node.get_tracks(query=lavalink_query)
+        if results is None:
+            log_event("lavalink search result: None")
+            return [], None, None
+
+        playlist_title = None
+        playlist_count = None
+        if isinstance(results, list):
+            tracks = results
+            log_event(f"lavalink search result: list size={len(tracks)}")
+        elif hasattr(results, "tracks"):
+            tracks = list(results.tracks)
+            log_event(f"lavalink search result: tracks size={len(tracks)}")
+            playlist_info = getattr(results, "playlist_info", None)
+            if playlist_info is not None:
+                playlist_title = getattr(playlist_info, "name", None) or getattr(playlist_info, "title", None)
+            playlist_title = playlist_title or getattr(results, "name", None)
+            playlist_count = len(tracks)
+        else:
+            tracks = [results]
+            log_event("lavalink search result: single track object")
+
+        if not tracks:
+            log_event("lavalink search result: empty tracks")
+            return [], None, None
+        if limit is not None and limit > 0:
+            tracks = tracks[:limit]
+
+        def to_youtube_search(track) -> YoutubeSearch:
+            title = getattr(track, "title", "Unknown")
+            uri = getattr(track, "uri", "") or ""
+            identifier = getattr(track, "identifier", "") or ""
+            duration = getattr(track, "length", 0) or 0
+            author = getattr(track, "author", "") or ""
+            thumbnail = getattr(track, "thumbnail", None)
+            if not thumbnail and identifier:
+                thumbnail = f"https://i.ytimg.com/vi/{identifier}/hqdefault.jpg"
+            video_url = uri or (f"https://www.youtube.com/watch?v={identifier}" if identifier else "")
+            return YoutubeSearch(
+                audio_source=uri or video_url,
+                title=title,
+                thumbnail_url=thumbnail or "",
+                duration=duration,
+                duration_string="",
+                video_id=identifier,
+                video_url=video_url,
+                channel_id="",
+                channel_url="",
+                channel_name=author,
+            )
+
+        tracks_app = [MusicApplication(
+            youtube_search=to_youtube_search(t),
+            user_id=requester.id,
+            user_name=requester.name,
+            user_icon=requester.display_avatar.url,
+        ) for t in tracks]
+
+        return tracks_app, playlist_title, playlist_count
+
+    async def _search_tracks(self, query: str, requester: discord.abc.User, limit: Optional[int] = None):
+        from core.config import AUDIO_BACKEND
+
+        if AUDIO_BACKEND == "lavalink":
+            return await self._search_tracks_lavalink(query, requester, limit)
+        return await self._search_tracks_ytdlp(query, requester)
+
     async def refresh_now_playing_embed(self, guild_id: int, *, is_paused: bool = False):
-        voice_model = self.music_queue.get(guild_id)
-        if voice_model is None:
+        status = await self.audio_service.get_status(guild_id)
+        if status is None or status.now_playing is None:
             return
-        music = voice_model.get("now_playing")
-        if music is None:
-            return
+        music = status.now_playing
         if is_paused:
             embed = music_pause_embed(
                 user_name=music.user_name,
@@ -58,7 +149,7 @@ class Music(commands.Cog):
                 music_title=music.youtube_search.title,
                 music_thumbnail=music.youtube_search.thumbnail_url,
                 music_url=music.youtube_search.video_url,
-                isLoop=voice_model.get("loop"),
+                isLoop=status.loop,
             )
         else:
             embed = music_play_embed(
@@ -67,15 +158,25 @@ class Music(commands.Cog):
                 music_title=music.youtube_search.title,
                 music_thumbnail=music.youtube_search.thumbnail_url,
                 music_url=music.youtube_search.video_url,
-                isLoop=voice_model.get("loop"),
+                isLoop=status.loop,
             )
-        queue_preview = self.build_queue_preview(voice_model["queue"])
+        queue_preview = self.build_queue_preview(status.queue)
         if queue_preview:
             embed.add_field(name="대기열", value=queue_preview, inline=False)
         await self.music_message_edit(
             guild_id=guild_id,
             embed=embed,
-            view=get_music_view(is_paused=is_paused, loop_enabled=voice_model.get("loop", False))
+            view=get_music_view(is_paused=is_paused, loop_enabled=status.loop)
+        )
+
+    async def _on_track_start(self, guild_id: int) -> None:
+        await self.refresh_now_playing_embed(guild_id=guild_id, is_paused=False)
+
+    async def _on_queue_empty(self, guild_id: int) -> None:
+        await self.music_message_edit(
+            guild_id=guild_id,
+            embed=music_stop_embed(),
+            view=None,
         )
 
     async def load_local_guild_channel(self):
@@ -157,30 +258,11 @@ class Music(commands.Cog):
         finally:
             state["pending"] = max((state["pending"] or 1) - 1, 0)
 
-    async def ensure_voice_model(self, message: discord.Message) -> MusicType:
-        guild_id = message.guild.id
-        voice_model = self.music_queue.get(guild_id)
-        vc = message.guild.voice_client
-
-        if voice_model is None or vc is None or not vc.is_connected():
-            if voice_model is not None:
-                try:
-                    voice_model["vc"].stop()
-                    await voice_model["vc"].disconnect()
-                except Exception:
-                    pass
-            vc = await message.author.voice.channel.connect()
-            voice_model = {
-                "guild_id": guild_id,
-                "voice_channel_id": message.author.voice.channel.id,
-                "vc": vc,
-                "volume": 1.0,
-                "queue": [],
-                "loop": False,
-            }
-            self.music_queue[guild_id] = voice_model
-
-        return voice_model
+    async def ensure_voice_model(self, message: discord.Message):
+        return await self.audio_service.ensure_state(
+            message.guild.id,
+            message.author.voice.channel,
+        )
 
     async def get_channel_message(self, guild_id: int) -> Optional[discord.Message]:
         music_model = self.guild_channel.get(guild_id, None)
@@ -218,7 +300,7 @@ class Music(commands.Cog):
         :raise CommandError:
         :return:
         """
-        if self.music_queue.get(ctx.guild.id) is None:
+        if not self.audio_service.has_state(ctx.guild.id):
             raise CommandError("음악이 재생되고 있지 않아요!")
 
         if isinstance(ctx, Interaction):
@@ -253,9 +335,9 @@ class Music(commands.Cog):
 
             # 봇의 채널 이동 처리
             if after.channel is not None:
-                queue = self.music_queue.get(member.guild.id)
-                if queue is not None:
-                    queue["voice_channel_id"] = after.channel.id
+                state = self.audio_service.states.get(member.guild.id)
+                if state is not None:
+                    state.voice_channel_id = after.channel.id
             return
 
         # 일반 유저가 채널을 나간 경우
@@ -273,40 +355,16 @@ class Music(commands.Cog):
         guild_id: int, 
         beforeMusic: Optional[MusicApplication] = None,
     ):
-        voice_model = self.music_queue[guild_id]
-        
-        if voice_model["loop"] and beforeMusic != None:
-            voice_model["queue"].append(beforeMusic)
-
-        if len(voice_model["queue"]) == 0:
-            voice_model["now_playing"] = None
-            await self.music_message_edit(
-                guild_id=guild_id,
-                embed=music_stop_embed(),
-                view=None
-            )
-            return
-
-        music = voice_model["queue"].pop(0)
-        source = FFmpegPCMAudio(music.youtube_search.audio_source, **FFMPEG_OPTIONS)
-        log_event(music.youtube_search.audio_source)
-        voice_model["now_playing"] = music
-        voice_model["vc"].play(
-            source,
-            after=lambda e: asyncio.run_coroutine_threadsafe(self.play_music(guild_id, music), self.bot.loop),
-        )
-        await self.refresh_now_playing_embed(guild_id, is_paused=False)
+        await self.audio_service.play_next(guild_id, beforeMusic)
 
     async def clear_guild_queue(self, guild_id: int):
-        if self.music_queue.get(guild_id) is not None:
-            self.music_queue[guild_id]["vc"].stop()
-            await self.music_queue[guild_id]["vc"].disconnect()
-            await self.music_message_edit(
-                guild_id=guild_id,
-                embed=music_stop_embed(),
-                view=None,
-            )
-        self.music_queue.pop(guild_id, None)
+        await self.audio_service.stop(guild_id)
+        await self.audio_service.disconnect(guild_id)
+        await self.music_message_edit(
+            guild_id=guild_id,
+            embed=music_stop_embed(),
+            view=None,
+        )
 
     async def music_message_edit(
         self,
@@ -360,16 +418,16 @@ class Music(commands.Cog):
 
     async def _pause(self, ctx: commands.Context | Interaction):
         self.check_voice_play(ctx)
+        status = await self.audio_service.get_status(ctx.guild.id)
+        if status is None or status.now_playing is None:
+            raise CommandError("??? ??????????? ??? ?????")
 
-        if not self.music_queue[ctx.guild.id]["vc"].is_playing():
-            raise CommandError("현재 음악을 재생하고 있지 않아요")
-        
-        self.music_queue[ctx.guild.id]["vc"].pause()
+        await self.audio_service.pause(ctx.guild.id)
         await self.refresh_now_playing_embed(ctx.guild.id, is_paused=True)
 
     async def _resume(self, ctx: commands.Context | Interaction):
         self.check_voice_play(ctx)
-        self.music_queue[ctx.guild.id]["vc"].resume()
+        await self.audio_service.resume(ctx.guild.id)
         await self.refresh_now_playing_embed(ctx.guild.id, is_paused=False)
 
     async def _stop(self, ctx: commands.Context | Interaction):
@@ -378,30 +436,31 @@ class Music(commands.Cog):
 
     async def _skip(self, ctx: commands.Context | Interaction):
         self.check_voice_play(ctx)
-        self.music_queue[ctx.guild.id]["vc"].stop()
+        await self.audio_service.skip(ctx.guild.id)
 
     async def _loop(self, ctx: commands.Context | Interaction) -> str:
         self.check_voice_play(ctx)
-        guild_queue = self.music_queue[ctx.guild.id]
-        guild_queue["loop"] = not guild_queue["loop"]
+        loop_enabled = await self.audio_service.toggle_loop(ctx.guild.id)
+        status = await self.audio_service.get_status(ctx.guild.id)
+        is_paused = status.is_paused if status else False
         await self.refresh_now_playing_embed(
             ctx.guild.id,
-            is_paused=guild_queue["vc"].is_paused()
+            is_paused=is_paused
         )
-        state = "켜짐" if guild_queue["loop"] else "꺼짐"
-        return f"반복을 {state}으로 설정했어요."
+        state = "???" if loop_enabled else "???"
+        return f"?????{state}??? ????????"
 
     async def _shuffle(self, ctx: commands.Context | Interaction) -> str:
         self.check_voice_play(ctx)
-        guild_queue = self.music_queue[ctx.guild.id]
-        if len(guild_queue["queue"]) < 2:
-            raise CommandError("셔플할 곡이 부족해요.")
-        random.shuffle(guild_queue["queue"])
+        status = await self.audio_service.get_status(ctx.guild.id)
+        if status is None or len(status.queue) < 2:
+            raise CommandError("???????? ???????")
+        await self.audio_service.shuffle(ctx.guild.id)
         await self.refresh_now_playing_embed(
             ctx.guild.id,
-            is_paused=guild_queue["vc"].is_paused()
+            is_paused=status.is_paused
         )
-        return "대기열을 섞었어요."
+        return "?????????????."
 
     @app_commands.command(name="채널설정")
     async def set_channel(self, interaction: Interaction, channel: discord.TextChannel):
@@ -522,9 +581,11 @@ class Music(commands.Cog):
         if message.author.voice is None:
             return
 
-        guild_queue = await self.ensure_voice_model(message)
-        if message.author.voice.channel.id != guild_queue["voice_channel_id"]:
+        existing_state = self.audio_service.states.get(message.guild.id)
+        if existing_state is not None and message.author.voice.channel.id != existing_state.voice_channel_id:
             return
+
+        await self.ensure_voice_model(message)
 
         async def delete_message():
             try:
@@ -534,36 +595,28 @@ class Music(commands.Cog):
 
         await delete_message()
 
-        search_result = await YoutubeService.search(message.content)
+        tracks, playlist_title, playlist_count = await self._search_tracks(message.content, message.author, limit=1)
 
         async def send_and_delete_message(content: str):
             await message.channel.send(content, delete_after=5)
 
-        if search_result is None:
+        if not tracks:
             await send_and_delete_message("노래를 찾지 못했어요..")
             return
 
-        def youtube_play_list_to_music_application(play_list: YoutubeSearch) -> MusicApplication:
-            return MusicApplication(
-                youtube_search=play_list,
-                user_id=message.author.id,
-                user_name=message.author.name,
-                user_icon=message.author.display_avatar.url,
-            )
+        await self.audio_service.enqueue_and_play(message.guild.id, message.author.voice.channel, tracks)
 
-        if isinstance(search_result, YoutubePlaylist):
-            guild_queue["queue"].extend(list(map(lambda x: youtube_play_list_to_music_application(x), search_result.songs)))
-            await send_and_delete_message(f"{search_result.title} 플레이 리스트를 추가했어요!\n추가된 곡 수: {search_result.song_cnt}")
+        if playlist_title:
+            count_text = playlist_count if playlist_count is not None else len(tracks)
+            await send_and_delete_message(f"{playlist_title} 플레이 리스트를 추가했어요!\n추가된 곡 수: {count_text}")
         else:
-            guild_queue["queue"].append(youtube_play_list_to_music_application(search_result))
-            await send_and_delete_message(f"{search_result.title} 곡을 추가했어요!")
+            await send_and_delete_message(f"{tracks[0].youtube_search.title} 곡을 추가했어요!")
 
-        if not guild_queue["vc"].is_playing():
-            await self.play_music(message.guild.id)
-        else:
+        status = await self.audio_service.get_status(message.guild.id)
+        if status:
             await self.refresh_now_playing_embed(
                 message.guild.id,
-                is_paused=guild_queue["vc"].is_paused()
+                is_paused=status.is_paused
             )
 
 
