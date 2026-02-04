@@ -12,6 +12,7 @@ Required:
 Audio backend selection:
 - `AUDIO_BACKEND=ffmpeg` (default) uses FFmpeg + yt-dlp
 - `AUDIO_BACKEND=lavalink` uses Lavalink (Pomice)
+- `AUDIO_BACKEND=hybrid` uses Lavalink for search + FFmpeg/yt-dlp for playback
 
 Lavalink (local server) settings:
 - `LAVALINK_HOST=127.0.0.1`

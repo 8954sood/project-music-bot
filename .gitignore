@@ -8,3 +8,6 @@ __pycache__
 cookies.txt
 lavalink/logs/*
 lavalink/*
+cookies*
+youtube-source/*
+youtube-trusted-session-generator/*

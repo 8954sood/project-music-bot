@@ -130,11 +130,42 @@ class Music(commands.Cog):
 
         return tracks_app, playlist_title, playlist_count
 
+    async def _search_tracks_hybrid(
+        self, query: str, requester: discord.abc.User, limit: Optional[int] = None
+    ):
+        from core.network.youtube.internal.youtube_utile import is_youtube_url
+
+        if is_youtube_url(query):
+            return await self._search_tracks_ytdlp(query, requester)
+
+        tracks, _, _ = await self._search_tracks_lavalink(query, requester, limit=1)
+        if not tracks:
+            return [], None, None
+
+        first = tracks[0].youtube_search
+        video_url = first.video_url or first.audio_source
+        if not video_url:
+            return [], None, None
+
+        resolved = await YoutubeService.url_search(video_url)
+        if resolved is None:
+            return [], None, None
+
+        app = MusicApplication(
+            youtube_search=resolved,
+            user_id=requester.id,
+            user_name=requester.name,
+            user_icon=requester.display_avatar.url,
+        )
+        return [app], None, None
+
     async def _search_tracks(self, query: str, requester: discord.abc.User, limit: Optional[int] = None):
         from core.config import AUDIO_BACKEND
 
         if AUDIO_BACKEND == "lavalink":
             return await self._search_tracks_lavalink(query, requester, limit)
+        if AUDIO_BACKEND == "hybrid":
+            return await self._search_tracks_hybrid(query, requester, limit)
         return await self._search_tracks_ytdlp(query, requester)
 
     async def refresh_now_playing_embed(self, guild_id: int, *, is_paused: bool = False):
