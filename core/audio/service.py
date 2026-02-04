@@ -100,6 +100,7 @@ class AudioService:
     async def play_next(self, guild_id: int, previous: Optional[MusicApplication] = None) -> None:
         while True:
             queue_empty_callback = None
+            next_track = None
             async with self._get_lock(guild_id):
                 state = self.states.get(guild_id)
                 if state is None:
@@ -113,14 +114,19 @@ class AudioService:
                     state.is_paused = False
                     queue_empty_callback = self.on_queue_empty
                     self._play_start_times.pop(guild_id, None)
-                    next_track = None
                 else:
                     next_track = state.queue.pop(0)
-                    state.now_playing = next_track
-                    state.is_paused = False
             if next_track is None:
                 if queue_empty_callback:
                     await queue_empty_callback(guild_id)
+                return
+
+            if await self.backend.is_playing(guild_id):
+                async with self._get_lock(guild_id):
+                    state = self.states.get(guild_id)
+                    if state is not None:
+                        state.queue.insert(0, next_track)
+                log_event(f"play_next skipped: already playing, re-queued track guild_id={guild_id}")
                 return
 
             try:
@@ -131,6 +137,11 @@ class AudioService:
                     log_event(
                         f"playback_start engine={AUDIO_BACKEND} guild_id={guild_id} elapsed_ms={elapsed_ms:.1f}"
                     )
+                async with self._get_lock(guild_id):
+                    state = self.states.get(guild_id)
+                    if state is not None:
+                        state.now_playing = next_track
+                        state.is_paused = False
                 if self.on_track_start:
                     await self.on_track_start(guild_id)
                 return
@@ -141,6 +152,11 @@ class AudioService:
                     if state is not None and state.now_playing == next_track:
                         state.now_playing = None
                         state.is_paused = False
+                try:
+                    if not await self.backend.is_playing(guild_id):
+                        await self.backend.stop(guild_id)
+                except Exception:
+                    pass
                 previous = None
                 continue
 

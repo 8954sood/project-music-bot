@@ -1,8 +1,10 @@
 import asyncio
+import time
 from typing import Optional, Union, List
 import yt_dlp
 
 from core import IS_DEBUG
+from core.util import log_event
 from core.network import YoutubePlaylist
 from core.network.youtube import YoutubeSearch
 from core.network.youtube.mapper.youtube_search_mapper import dict_to_youtube_search
@@ -31,6 +33,7 @@ class YoutubeService:
     @staticmethod
     async def url_search(url: str) -> Optional[YoutubeSearch]:
         loop = asyncio.get_event_loop()
+        start_time = time.monotonic()
         try:
             with yt_dlp.YoutubeDL(YoutubeService.YDL_OPTIONS) as ytdl:
                 ytdl.cookiejar.load('./cookies.txt', ignore_discard=True, ignore_expires=True)
@@ -38,6 +41,8 @@ class YoutubeService:
                     None,
                     lambda: ytdl.extract_info(url, download=False)
                 )
+                elapsed_ms = (time.monotonic() - start_time) * 1000
+                log_event(f"ytdlp_resolve kind=url elapsed_ms={elapsed_ms:.1f}")
                 return dict_to_youtube_search(data)
         except (yt_dlp.utils.ExtractorError, yt_dlp.utils.DownloadError):
             return None
@@ -46,6 +51,7 @@ class YoutubeService:
     @staticmethod
     async def title_search(title: str) -> Optional[YoutubeSearch]:
         loop = asyncio.get_event_loop()
+        start_time = time.monotonic()
         try:
             with yt_dlp.YoutubeDL(YoutubeService.YDL_OPTIONS) as ytdl:
                 ytdl.cookiejar.load('./cookies.txt', ignore_discard=True, ignore_expires=True)
@@ -53,6 +59,8 @@ class YoutubeService:
                     None,
                     lambda: ytdl.extract_info(f"ytsearch:{title}", download=False)
                 )
+                elapsed_ms = (time.monotonic() - start_time) * 1000
+                log_event(f"ytdlp_resolve kind=search elapsed_ms={elapsed_ms:.1f}")
                 return dict_to_youtube_search(data['entries'][0])
         except (yt_dlp.utils.ExtractorError, yt_dlp.utils.DownloadError):
             return None
@@ -81,6 +89,8 @@ class YoutubeService:
                     if len(mapping_songs) == 0:
                         return None
 
+                    elapsed_ms = (time.monotonic() - start_time) * 1000
+                    log_event(f"ytdlp_resolve kind=playlist elapsed_ms={elapsed_ms:.1f}")
                     return YoutubePlaylist(
                         title=data.get('title', '알 수 없음'),
                         song_cnt=len(mapping_songs),

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Dict, List, Optional, Sequence, Union
 
 import discord
@@ -70,7 +71,10 @@ class Music(commands.Cog):
 
         lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
         log_event(f"lavalink search query={lavalink_query}")
+        start_time = time.monotonic()
         results = await backend._node.get_tracks(query=lavalink_query)
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+        log_event(f"lavalink_search elapsed_ms={elapsed_ms:.1f}")
         if results is None:
             log_event("lavalink search result: None")
             return [], None, None
@@ -138,6 +142,7 @@ class Music(commands.Cog):
         if is_youtube_url(query):
             return await self._search_tracks_ytdlp(query, requester)
 
+        total_start = time.monotonic()
         tracks, _, _ = await self._search_tracks_lavalink(query, requester, limit=1)
         if not tracks:
             return [], None, None
@@ -150,6 +155,8 @@ class Music(commands.Cog):
         resolved = await YoutubeService.url_search(video_url)
         if resolved is None:
             return [], None, None
+        total_ms = (time.monotonic() - total_start) * 1000
+        log_event(f"hybrid_resolve elapsed_ms={total_ms:.1f}")
 
         app = MusicApplication(
             youtube_search=resolved,
