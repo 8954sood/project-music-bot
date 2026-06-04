@@ -77,6 +77,23 @@ async def reload_cog(ctx, cog: str = "all"):
     except Exception as exc:
         await ctx.send(f"reload failed: {cog} ({exc})")
 
+@bot.command("nodes")
+@commands.is_owner()
+async def refresh_nodes(ctx):
+    # lavalink-node 엔진일 때 공개 노드 풀을 재탐색(YouTube 재생 가능 판별 + sticky 리셋).
+    cog = bot.get_cog("Music")
+    backend = getattr(cog.audio_service, "backend", None) if cog else None
+    if backend is None or not hasattr(backend, "refresh_nodes"):
+        return await ctx.send("현재 엔진은 lavalink-node 가 아닙니다.")
+    await ctx.send("노드 재탐색 중...")
+    try:
+        healthy = await backend.refresh_nodes()
+    except Exception as exc:
+        return await ctx.send(f"노드 재탐색 실패: {exc}")
+    lines = "\n".join(f"- {n.label} (secure={n.secure})" for n in healthy) or "(없음)"
+    await ctx.send(f"재생 가능 노드 {len(healthy)}개:\n{lines}")
+
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):

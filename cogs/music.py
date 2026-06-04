@@ -75,18 +75,43 @@ class Music(commands.Cog):
         results = await backend._node.get_tracks(query=lavalink_query)
         elapsed_ms = (time.monotonic() - start_time) * 1000
         log_event(f"lavalink_search elapsed_ms={elapsed_ms:.1f}")
+        return self._lavalink_results_to_tracks(results, requester, limit)
+
+    async def _search_tracks_lavalink_node(
+        self, query: str, requester: discord.abc.User, limit: Optional[int] = None
+    ):
+        # lavalink-node 엔진: 공개 노드 풀에서 직접 검색(loadtracks). sticky failover 사용.
+        # ffmpeg 와 달리 yt-dlp/cookies.txt 가 필요 없다.
+        backend = self.audio_service.backend
+        from core.network.youtube.internal.youtube_utile import is_youtube_url
+
+        lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
+        log_event(f"lavalink-node search query={lavalink_query}")
+        start_time = time.monotonic()
+        try:
+            results = await backend.get_tracks(lavalink_query)
+        except Exception as exc:
+            # 사용 가능한 노드가 없거나 전부 실패 → 빈 결과로 처리.
+            log_event(f"lavalink-node search failed: {exc}")
+            return [], None, None
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+        log_event(f"lavalink_node_search elapsed_ms={elapsed_ms:.1f}")
+        return self._lavalink_results_to_tracks(results, requester, limit)
+
+    def _lavalink_results_to_tracks(
+        self, results, requester: discord.abc.User, limit: Optional[int] = None
+    ):
+        # pomice get_tracks 원시 결과(list / Playlist / 단일 / None)를 MusicApplication 리스트로 변환.
+        # lavalink 와 lavalink-node 검색이 공유.
         if results is None:
-            log_event("lavalink search result: None")
             return [], None, None
 
         playlist_title = None
         playlist_count = None
         if isinstance(results, list):
             tracks = results
-            log_event(f"lavalink search result: list size={len(tracks)}")
         elif hasattr(results, "tracks"):
             tracks = list(results.tracks)
-            log_event(f"lavalink search result: tracks size={len(tracks)}")
             playlist_info = getattr(results, "playlist_info", None)
             if playlist_info is not None:
                 playlist_title = getattr(playlist_info, "name", None) or getattr(playlist_info, "title", None)
@@ -94,10 +119,8 @@ class Music(commands.Cog):
             playlist_count = len(tracks)
         else:
             tracks = [results]
-            log_event("lavalink search result: single track object")
 
         if not tracks:
-            log_event("lavalink search result: empty tracks")
             return [], None, None
         if limit is not None and limit > 0:
             tracks = tracks[:limit]
@@ -171,6 +194,8 @@ class Music(commands.Cog):
 
         if AUDIO_BACKEND == "lavalink":
             return await self._search_tracks_lavalink(query, requester, limit)
+        if AUDIO_BACKEND == "lavalink-node":
+            return await self._search_tracks_lavalink_node(query, requester, limit)
         if AUDIO_BACKEND == "hybrid":
             return await self._search_tracks_hybrid(query, requester, limit)
         return await self._search_tracks_ytdlp(query, requester)

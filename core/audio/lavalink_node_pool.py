@@ -33,6 +33,7 @@ import aiohttp
 
 from core.config import (
     LAVALINK_LIST_URL,
+    LAVALINK_NODE_PROBE_EXEMPT_HOSTS,
     LAVALINK_NODE_PROBE_QUERY,
     LAVALINK_NODE_PROBE_TIMEOUT,
     LAVALINK_NODE_SECURE_ONLY,
@@ -97,6 +98,8 @@ class LavalinkNodePool:
         self._secure_only: bool = (
             LAVALINK_NODE_SECURE_ONLY if secure_only is None else secure_only
         )
+        # YouTube 판별(probe)을 생략하고 항상 healthy 로 취급할 호스트.
+        self._probe_exempt_hosts = set(LAVALINK_NODE_PROBE_EXEMPT_HOSTS)
 
     # ------------------------------------------------------------------ #
     # 조회
@@ -204,18 +207,25 @@ class LavalinkNodePool:
             self._current_index = 0
             return []
 
-        results = await asyncio.gather(
-            *(self.probe_youtube(node) for node in self._all),
+        # 예외 호스트는 probe 생략(항상 healthy). 나머지만 동시에 판별한다.
+        to_probe = [node for node in self._all if node.host not in self._probe_exempt_hosts]
+        probe_results = await asyncio.gather(
+            *(self.probe_youtube(node) for node in to_probe),
             return_exceptions=True,
         )
-        healthy = [
-            node
-            for node, ok in zip(self._all, results)
-            if ok is True  # 예외는 ok 가 Exception 이므로 자동 제외
-        ]
+        probe_ok = {id(node): (ok is True) for node, ok in zip(to_probe, probe_results)}
+
+        healthy = []
+        for node in self._all:  # 원본 순서 유지
+            if node.host in self._probe_exempt_hosts:
+                log_event(f"probe skipped (exempt) node={node.label} -> YES")
+                healthy.append(node)
+            elif probe_ok.get(id(node)):
+                healthy.append(node)
+
         self._healthy = healthy
         self._current_index = 0  # 재탐색 = sticky 리셋
-        log_event(f"discover: {len(healthy)}/{len(self._all)} nodes can play YouTube")
+        log_event(f"discover: {len(healthy)}/{len(self._all)} nodes available (incl. exempt)")
         return list(healthy)
 
     def reset(self) -> None:

@@ -24,3 +24,11 @@ LAVALINK_NODE_SECURE_ONLY = os.getenv("LAVALINK_NODE_SECURE_ONLY", "true").strip
     "yes",
     "on",
 )
+# YouTube 재생 판별(probe)을 생략하고 항상 healthy 로 취급할 호스트(콤마 구분).
+#   "항상 되는" 노드를 매번 판별하느라 시간 쓰지 않기 위함. 실제 재생 가능 여부는
+#   play 단계의 failover 가 검증한다(loadtracks/play 실패 시 자동 제외).
+LAVALINK_NODE_PROBE_EXEMPT_HOSTS = [
+    h.strip()
+    for h in os.getenv("LAVALINK_NODE_PROBE_EXEMPT_HOSTS", "lavalinkv4.serenetia.com").split(",")
+    if h.strip()
+]

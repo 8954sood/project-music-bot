@@ -6,6 +6,7 @@ import discord
 
 from core.audio.ffmpeg_backend import FFmpegBackend
 from core.audio.lavalink_backend import LavalinkBackend
+from core.audio.lavalink_node_backend import LavalinkNodeBackend
 from core.audio.hybrid_backend import HybridBackend
 from core.audio.service import AudioService
 from core.config import AUDIO_BACKEND, LAVALINK_HOST, LAVALINK_IDENTIFIER, LAVALINK_PASSWORD, LAVALINK_PORT
@@ -26,6 +27,9 @@ def create_audio_service(bot: discord.Client) -> AudioService:
             password=LAVALINK_PASSWORD,
             identifier=LAVALINK_IDENTIFIER,
         )
+    elif AUDIO_BACKEND == "lavalink-node":
+        # 공개 노드 풀 + sticky failover. host/port 불필요 — 풀이 노드를 가져옴.
+        backend = LavalinkNodeBackend()
     else:
         backend = FFmpegBackend()
 
