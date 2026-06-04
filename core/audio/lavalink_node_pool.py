@@ -1,0 +1,270 @@
+"""공개 Lavalink 노드 풀 + 순서 기반 sticky failover.
+
+이 모듈은 DarrenOfficial/lavalink-list 의 공개 노드 목록을 받아와서, 각 노드가 실제로
+YouTube 재생이 가능한지 판별하고(= /v4/loadtracks 호출), 통과한 노드들을 순서대로 묶어
+failover 재생을 지원한다.
+
+설계 원칙
+---------
+* 순수 async 로직만 둔다. discord.py / pomice / wavelink 등 어떤 외부 lavalink 라이브러리도
+  import 하지 않는다. 덕분에 디스코드 연결 없이 맥북에서 단일 스크립트(test/lavalink_node_test.py)로
+  그대로 재사용해 검증할 수 있고, 봇 통합(LavalinkNodeBackend)도 이 풀을 공유한다.
+* "노드별 재생 동작"은 호출자가 콜백(action)으로 주입한다. 로컬 테스트는 yt-dlp+ffplay로,
+  봇은 Lavalink v4 클라이언트로 같은 failover 로직을 태운다.
+
+failover 규칙 (사용자 요구사항, 엄수)
+-------------------------------------
+* 노드 목록은 순서가 있다. 재생은 항상 "현재 sticky 포인터"가 가리키는 노드부터 시작한다.
+* 1번 실패 → 1번 실패처리(_healthy 에서 제거) → 2번 재시도 → 2번 실패 → 실패처리 → 3번 ...
+* 3번에서 성공하면 sticky 포인터를 3번으로 옮긴다. 즉 다음 재생 시도는 무조건 3번부터 시작한다.
+* 한 번 실패처리된 노드는 다음 discover()(재탐색) 전까지 풀에서 제외된다.
+* 사용자가 재탐색 명령(-nodes)을 쓰거나 봇을 새로 껐다 켜면 discover() 가 다시 돌면서
+  풀과 sticky 포인터가 전부 리셋된다.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import urllib.parse
+from dataclasses import dataclass
+from typing import Awaitable, Callable, List, Optional, TypeVar
+
+import aiohttp
+
+from core.config import (
+    LAVALINK_LIST_URL,
+    LAVALINK_NODE_PROBE_QUERY,
+    LAVALINK_NODE_PROBE_TIMEOUT,
+    LAVALINK_NODE_SECURE_ONLY,
+)
+from core.util import log_event
+
+T = TypeVar("T")
+
+# loadtracks 가 "재생 가능한 결과"로 간주하는 loadType 들 (Lavalink v4).
+_PLAYABLE_LOAD_TYPES = {"search", "track"}
+
+
+@dataclass
+class NodeInfo:
+    """lavalink-list API 한 항목. 필드명은 API 응답(JSON) 기준."""
+
+    unique_id: str
+    identifier: str
+    host: str
+    port: int
+    password: str
+    secure: bool
+    version: str
+
+    @property
+    def scheme(self) -> str:
+        return "https" if self.secure else "http"
+
+    @property
+    def ws_scheme(self) -> str:
+        return "wss" if self.secure else "ws"
+
+    @property
+    def rest_base(self) -> str:
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+    @property
+    def label(self) -> str:
+        return f"{self.host}:{self.port}"
+
+    @classmethod
+    def from_api(cls, raw: dict) -> "NodeInfo":
+        return cls(
+            unique_id=str(raw.get("unique-id") or raw.get("identifier") or ""),
+            identifier=str(raw.get("identifier") or raw.get("unique-id") or ""),
+            host=str(raw["host"]),
+            port=int(raw["port"]),
+            password=str(raw.get("password") or ""),
+            secure=bool(raw.get("secure", False)),
+            version=str(raw.get("version") or ""),
+        )
+
+
+class LavalinkNodePool:
+    def __init__(self, *, secure_only: Optional[bool] = None) -> None:
+        self._all: List[NodeInfo] = []      # API 원본 순서 유지
+        self._healthy: List[NodeInfo] = []  # YouTube 판별 통과 노드, 순서 유지
+        # sticky 포인터: 다음 재생을 "시작"할 _healthy 내 인덱스.
+        self._current_index: int = 0
+        # secure(wss) 노드만 쓸지. None 이면 config(LAVALINK_NODE_SECURE_ONLY) 기본값 사용.
+        # 음성 자격증명 평문 노출 방지용 (config 주석 참고).
+        self._secure_only: bool = (
+            LAVALINK_NODE_SECURE_ONLY if secure_only is None else secure_only
+        )
+
+    # ------------------------------------------------------------------ #
+    # 조회
+    # ------------------------------------------------------------------ #
+    @property
+    def healthy_nodes(self) -> List[NodeInfo]:
+        return list(self._healthy)
+
+    @property
+    def all_nodes(self) -> List[NodeInfo]:
+        return list(self._all)
+
+    @property
+    def current_node(self) -> Optional[NodeInfo]:
+        if 0 <= self._current_index < len(self._healthy):
+            return self._healthy[self._current_index]
+        return None
+
+    # ------------------------------------------------------------------ #
+    # 1) 노드 목록 fetch
+    # ------------------------------------------------------------------ #
+    async def fetch_nodes(self) -> List[NodeInfo]:
+        """lavalink-list REST API 에서 노드 목록을 받아 v4 노드만 반환한다.
+
+        실패/타임아웃 시 빈 목록을 반환하고 로그를 남긴다(예외를 던지지 않음).
+        """
+        timeout = aiohttp.ClientTimeout(total=LAVALINK_NODE_PROBE_TIMEOUT)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(LAVALINK_LIST_URL) as resp:
+                    if resp.status != 200:
+                        log_event(f"fetch_nodes HTTP {resp.status} from {LAVALINK_LIST_URL}")
+                        self._all = []
+                        return []
+                    data = await resp.json(content_type=None)
+        except Exception as exc:  # 네트워크/파싱 오류 전부 흡수
+            log_event(f"fetch_nodes failed: {exc}")
+            self._all = []
+            return []
+
+        nodes: List[NodeInfo] = []
+        for raw in data or []:
+            try:
+                node = NodeInfo.from_api(raw)
+            except Exception as exc:
+                log_event(f"fetch_nodes skip malformed entry: {exc}")
+                continue
+            # pomice 미사용이지만 우리 v4 클라이언트도 v4 전용이므로 v4만 사용.
+            if node.version.lower() != "v4":
+                continue
+            # secure-only 모드면 non-secure 노드 제외 (음성 토큰 평문 노출 방지).
+            if self._secure_only and not node.secure:
+                continue
+            nodes.append(node)
+
+        self._all = nodes
+        secure_note = " (secure-only)" if self._secure_only else ""
+        log_event(f"fetch_nodes ok: {len(nodes)} v4 nodes from list{secure_note}")
+        return nodes
+
+    # ------------------------------------------------------------------ #
+    # 2) YouTube 재생 가능 여부 판별 (= loadtracks)
+    # ------------------------------------------------------------------ #
+    async def probe_youtube(self, node: NodeInfo) -> bool:
+        """노드가 YouTube 검색/로드를 실제로 처리하는지 /v4/loadtracks 로 확인.
+
+        많은 공개 노드가 YouTube 를 막아두거나 죽어 있으므로(연결 거부/500 등) 이 판별이
+        이 기능의 핵심이다. 디스코드/음성 연결과 무관하게 순수 REST 로 확인한다.
+        """
+        identifier = f"ytsearch:{LAVALINK_NODE_PROBE_QUERY}"
+        encoded = urllib.parse.quote(identifier, safe="")
+        url = f"{node.rest_base}/v4/loadtracks?identifier={encoded}"
+        headers = {"Authorization": node.password}
+        timeout = aiohttp.ClientTimeout(total=LAVALINK_NODE_PROBE_TIMEOUT)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        log_event(f"probe {node.label} HTTP {resp.status} -> NO")
+                        return False
+                    data = await resp.json(content_type=None)
+        except Exception as exc:
+            log_event(f"probe {node.label} error: {exc} -> NO")
+            return False
+
+        load_type = (data or {}).get("loadType")
+        payload = (data or {}).get("data")
+        # v4: search -> data 는 트랙 리스트, track -> data 는 단일 트랙 객체.
+        has_result = bool(payload) if not isinstance(payload, list) else len(payload) > 0
+        ok = load_type in _PLAYABLE_LOAD_TYPES and has_result
+        log_event(f"probe {node.label} loadType={load_type} -> {'YES' if ok else 'NO'}")
+        return ok
+
+    # ------------------------------------------------------------------ #
+    # 3) 재탐색 (시작 시 자동 / -nodes 명령 / 재시작)
+    # ------------------------------------------------------------------ #
+    async def discover(self) -> List[NodeInfo]:
+        """노드 목록을 받아 전부 동시에 판별하고, 통과 노드로 풀을 리빌드한다.
+
+        discover() 가 불릴 때마다 풀과 sticky 포인터가 완전히 리셋된다(실패처리 이력 포함).
+        """
+        await self.fetch_nodes()
+        if not self._all:
+            self._healthy = []
+            self._current_index = 0
+            return []
+
+        results = await asyncio.gather(
+            *(self.probe_youtube(node) for node in self._all),
+            return_exceptions=True,
+        )
+        healthy = [
+            node
+            for node, ok in zip(self._all, results)
+            if ok is True  # 예외는 ok 가 Exception 이므로 자동 제외
+        ]
+        self._healthy = healthy
+        self._current_index = 0  # 재탐색 = sticky 리셋
+        log_event(f"discover: {len(healthy)}/{len(self._all)} nodes can play YouTube")
+        return list(healthy)
+
+    def reset(self) -> None:
+        """sticky 포인터만 처음으로 되돌린다(노드 목록은 유지)."""
+        self._current_index = 0
+
+    # ------------------------------------------------------------------ #
+    # 4) sticky failover 코어
+    # ------------------------------------------------------------------ #
+    async def run_with_failover(self, action: Callable[[NodeInfo], Awaitable[T]]) -> T:
+        """현재 sticky 노드부터 순서대로 action 을 시도한다.
+
+        action(node) 는 그 노드로 재생을 시도하고, 실패하면 예외를 던져야 한다.
+        - 성공: sticky 포인터를 그 노드로 옮기고(다음 시도도 여기서 시작) 결과를 반환.
+        - 실패: 그 노드를 _healthy 에서 제거(실패처리)하고 다음 노드로 넘어간다.
+        - 전부 실패: RuntimeError.
+
+        예) 노드 [A, B, C], sticky=A 에서 A 실패→B 실패→C 성공 이면
+            C 가 풀에 남고 sticky=C 가 되어 다음 재생은 C 부터 시작한다.
+        """
+        if not self._healthy:
+            raise RuntimeError("사용 가능한 Lavalink 노드가 없습니다. (discover 필요)")
+
+        last_error: Optional[Exception] = None
+        # sticky 포인터 위치에서 시작. 실패한 노드는 즉시 제거하므로, 리스트가 줄어드는 동안
+        # index 는 같은 자리를 유지하면(=다음 노드가 그 자리로 당겨짐) 순서대로 순회된다.
+        index = min(self._current_index, len(self._healthy) - 1)
+        attempts = 0
+        total = len(self._healthy)
+
+        while self._healthy and attempts < total:
+            node = self._healthy[index]
+            attempts += 1
+            try:
+                result = await action(node)
+            except Exception as exc:
+                last_error = exc
+                log_event(f"failover: node {node.label} failed -> dropped ({exc})")
+                # 실패처리: 풀에서 제거. 제거하면 다음 노드가 같은 index 자리로 당겨진다.
+                self._healthy.pop(index)
+                if index >= len(self._healthy):
+                    index = 0  # 끝까지 갔으면 앞에서부터 남은 노드 시도
+                continue
+
+            # 성공 → sticky 포인터를 이 노드로 고정.
+            self._current_index = index
+            log_event(f"failover: node {node.label} OK -> sticky set (index={index})")
+            return result
+
+        raise RuntimeError(
+            f"모든 노드 failover 실패 ({total}개 시도). 마지막 오류: {last_error}"
+        )
