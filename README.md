@@ -35,8 +35,9 @@ until it fails, then the next node is tried).
 - `LAVALINK_NODE_PROBE_QUERY=lofi hip hop` — probe search term
 - `LAVALINK_NODE_SECURE_ONLY=true` — only use secure (wss) nodes. Recommended on, since non-secure
   nodes transmit the Discord voice token in plaintext. (The bot token is never sent to nodes.)
-- `LAVALINK_NODE_PROBE_EXEMPT_HOSTS=lavalinkv4.serenetia.com` — comma-separated hosts to skip the
-  YouTube probe for (always treated as available; actual playability is verified by play-time failover)
+
+Only nodes that pass both the YouTube probe and pomice's `/version` check are used; flaky nodes are
+skipped automatically and re-evaluated on restart / `-nodes`.
 
 ## Commands
 - `-reload [cog]` (owner) — reload cogs

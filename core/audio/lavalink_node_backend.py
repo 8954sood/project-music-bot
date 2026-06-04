@@ -27,6 +27,7 @@ import discord
 
 from core.audio.backend import AudioBackend, OnTrackEnd
 from core.audio.lavalink_node_pool import LavalinkNodePool, NodeInfo
+from core.config import LAVALINK_NODE_PROBE_TIMEOUT
 from core.model.music_application import MusicApplication
 from core.util import log_event
 
@@ -44,60 +45,122 @@ class LavalinkNodeBackend(AudioBackend):
         self._players: Dict[int, "pomice.Player"] = {}
         self._monitor_tasks: Dict[int, asyncio.Task] = {}
         self._created: Set[str] = set()  # create_node 성공한 노드 identifier
+        self._register_lock = asyncio.Lock()  # discover/등록 동시 실행 직렬화
 
     # ------------------------------------------------------------------ #
     # 수명주기
     # ------------------------------------------------------------------ #
     async def connect(self, bot: discord.Client) -> None:
         self._bot = bot
-        await self._register_pool_nodes()
+        async with self._register_lock:
+            await self._register_pool_nodes()
+
+    def _available_nodes(self):
+        return [n for n in self._pomice.NodePool._nodes.values() if getattr(n, "_available", False)]
+
+    async def _ensure_nodes_ready(self) -> None:
+        """pomice 노드가 하나도 없으면 (재)등록. 시작 직후 discover 완료 전에 재생 요청이 와도
+        NoNodesAvailable 로 죽지 않도록 한다."""
+        if self._available_nodes():
+            return
+        async with self._register_lock:
+            if self._available_nodes():  # 대기 중 다른 코루틴이 등록했을 수 있음
+                return
+            await self._register_pool_nodes()
 
     async def _register_pool_nodes(self) -> None:
-        """풀을 탐색(REST 판별)한 뒤 통과 노드를 pomice 노드로 등록한다."""
-        healthy = await self._pool.discover()
-        self._created.clear()
-        for node in healthy:
-            try:
-                await self._connect_node(node)
-                self._created.add(node.identifier)
-            except Exception as exc:
-                # 공개 노드는 불안정 — 연결 실패는 흡수(풀 failover 가 이후 자동 제외).
-                log_event(f"node connect failed node={node.label}: {exc}")
-        log_event(f"lavalink-node: {len(self._created)}/{len(healthy)} pomice nodes connected")
+        """노드 목록을 받아 각 노드의 (YouTube 판별 + /version 연결 + ready)를 **하나의 파이프라인**으로
+        묶어 모든 노드를 동시에 처리한다.
 
-    async def _connect_node(self, node: NodeInfo) -> None:
-        """pomice 노드를 /version 자동감지 없이 v4 로 고정해 직접 연결한다.
+        probe 와 register 를 노드별로 합쳐 한 번에 돌리고, **전체를 하나의 데드라인
+        (LAVALINK_NODE_PROBE_TIMEOUT) 안에서** 수행한다. 좋은 노드는 probe+register 가 빨라 그 안에
+        끝나고, 느린/죽은 노드는 데드라인에서 잘려 제외된다(probe 와 register 가 각각 별도 타임아웃을
+        먹어 합산되던 문제를 없앤다).
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + LAVALINK_NODE_PROBE_TIMEOUT
 
-        공개 노드 중에는 /version 엔드포인트가 다른 사이트로 리다이렉트되거나 HTML/502 를 돌려줘서
-        pomice 의 기본 create_node(버전 자동감지)가 ContentTypeError 로 실패하는 "특수 구조" 노드가
-        있다(예: lavalinkv4.serenetia.com). 우리는 노드 목록 API 에서 이미 version=="v4" 임을 알고
-        있으므로, 버전 체크를 건너뛰고(connect(reconnect=True) 는 /version 페치를 하지 않음) v4 로
-        고정해 연결한다.
+        nodes = await self._pool.fetch_nodes(timeout=max(0.1, deadline - loop.time()))
+        results = await asyncio.gather(
+            *(self._check_and_register(node, deadline) for node in nodes),
+            return_exceptions=True,
+        )
+        self._created = {nid for nid in results if isinstance(nid, str)}
 
-        ⚠️ pomice semi-private 내부에 의존(Node / _version / _available / NodePool._nodes /
-           connect(reconnect=True)). pomice 버전 업 시 점검 필요.
+        # YouTube 판별 + 연결까지 통과한 노드만 failover 대상으로.
+        self._pool.set_healthy([n for n in nodes if n.identifier in self._created])
+        log_event(f"lavalink-node: {len(self._created)}/{len(nodes)} pomice nodes connected")
+
+    async def _check_and_register(self, node: NodeInfo, deadline: float) -> Optional[str]:
+        """노드 1개: YouTube 판별 → /version 연결 → ready 대기 → 버전보정. 성공 시 identifier.
+
+        모든 네트워크 단계가 공유 deadline 까지 남은 시간으로 제한된다(probe+register 총합이
+        LAVALINK_NODE_PROBE_TIMEOUT 을 넘지 않음).
         """
         from pomice.utils import LavalinkVersion
 
-        if node.identifier in self._pomice.NodePool._nodes:
-            return  # 이미 연결됨
+        loop = asyncio.get_event_loop()
+        remaining = lambda: max(0.1, deadline - loop.time())  # noqa: E731
 
-        pnode = self._pomice.Node(
-            pool=self._pomice.NodePool,
-            bot=self._bot,
-            host=node.host,
-            port=node.port,
-            password=node.password,
-            identifier=node.identifier,
-            secure=node.secure,
-            # fallback=False: 노드 전환(failover)은 우리 풀이 deterministic 하게 담당한다.
-            # pomice 자체 node-switch 와 충돌하지 않도록 끈다.
-            fallback=False,
-        )
-        pnode._version = LavalinkVersion(major=4, minor=0, fix=0)
-        await pnode.connect(reconnect=True)  # reconnect=True → /version 페치 스킵
-        pnode._available = True  # reconnect 경로는 _available 을 직접 세팅하지 않음
-        self._pomice.NodePool._nodes[node.identifier] = pnode
+        # 1) YouTube 재생 가능 판별
+        try:
+            ok = await self._pool.probe_youtube(node, timeout=remaining())
+        except Exception:
+            ok = False
+        if not ok:
+            return None
+
+        if node.identifier in self._pomice.NodePool._nodes:
+            return node.identifier
+
+        # 2) /version 검증 + WS 연결
+        try:
+            pnode = await asyncio.wait_for(
+                self._pomice.NodePool.create_node(
+                    bot=self._bot,
+                    host=node.host,
+                    port=node.port,
+                    password=node.password,
+                    identifier=node.identifier,
+                    secure=node.secure,
+                ),
+                timeout=remaining(),
+            )
+        except Exception as exc:
+            # /version 실패/타임아웃/연결 실패 노드는 수용하지 않는다(스킵).
+            log_event(f"create_node failed (skipped) node={node.label}: {exc}")
+            self._pomice.NodePool._nodes.pop(node.identifier, None)  # 타임아웃 시 잔여분 정리
+            return None
+
+        # 3) WS ready(op) 로 session_id 가 잡힐 때까지 대기(없으면 Player endpoint uri 가
+        #    sessions/None → 404 Session not found). 남은 데드라인까지만 기다린다.
+        if not await self._await_session(pnode, timeout=remaining()):
+            log_event(f"node {node.label} ready timeout (no session id) -> skip")
+            try:
+                await pnode.disconnect()
+            except Exception:
+                pass
+            self._pomice.NodePool._nodes.pop(node.identifier, None)
+            return None
+
+        # 4) Lavalink 4.2+ 는 voice payload 에 channelId 가 필수. SNAPSHOT 등으로 4.2 미만으로 잡히면
+        #    channelId 가 빠져 voice PATCH 가 400 나므로 버전을 올린다(구버전은 무시 → 안전).
+        try:
+            if pnode._version < LavalinkVersion(4, 2, 0):
+                pnode._version = LavalinkVersion(4, 4, 0)
+        except Exception:
+            pass
+        return node.identifier
+
+    async def _await_session(self, pnode, *, timeout: float = 8.0) -> bool:
+        """pomice 노드가 WS ready 로 session_id 를 받을 때까지 대기. 받으면 True."""
+        waited = 0.0
+        while waited < timeout:
+            if getattr(pnode, "_session_id", None):
+                return True
+            await asyncio.sleep(0.1)
+            waited += 0.1
+        return bool(getattr(pnode, "_session_id", None))
 
     # ------------------------------------------------------------------ #
     # 노드 이동 (안전한 swap)
@@ -142,13 +205,27 @@ class LavalinkNodeBackend(AudioBackend):
         return value() if callable(value) else bool(value)
 
     async def ensure_player(self, guild_id: int, voice_channel: discord.VoiceChannel) -> None:
-        player = self._players.get(guild_id)
-        if player is not None and self._is_connected(player):
-            current_channel = getattr(player, "channel", None)
-            if current_channel is not None and current_channel.id == voice_channel.id:
+        # 재생 요청이 시작 직후(노드 등록 전)에 와도 죽지 않도록 노드 준비 보장.
+        await self._ensure_nodes_ready()
+
+        # guild.voice_client(=pomice.Player) 를 단일 진실원으로 삼는다(self._players 가 stale 일 수 있음).
+        guild = voice_channel.guild
+        player = guild.voice_client
+        if player is not None:
+            same_channel = (
+                self._is_connected(player)
+                and getattr(player, "channel", None) is not None
+                and player.channel.id == voice_channel.id
+            )
+            if same_channel:
+                self._players[guild_id] = player
                 return
-            await player.move_to(voice_channel)
-            return
+            # 다른 채널이거나 stale 상태 → 깔끔히 끊고 새로 연결("Already connected" 방지).
+            try:
+                await player.disconnect(force=True)
+            except Exception:
+                pass
+            self._players.pop(guild_id, None)
 
         player = await voice_channel.connect(cls=self._pomice.Player)
         self._players[guild_id] = player
@@ -217,23 +294,34 @@ class LavalinkNodeBackend(AudioBackend):
 
         self._monitor_tasks[guild_id] = asyncio.create_task(_monitor())
 
+    # 제어 동작은 best-effort: 노드 오류(예: 404 Session not found, 죽은 노드)로 인해
+    # 호출부(특히 on_voice_state_update 정리 핸들러)가 죽지 않도록 예외를 흡수한다.
     async def stop(self, guild_id: int) -> None:
         player = self._players.get(guild_id)
         if player is None:
             return
-        await player.stop()
+        try:
+            await player.stop()
+        except Exception as exc:
+            log_event(f"stop error guild={guild_id}: {exc}")
 
     async def pause(self, guild_id: int) -> None:
         player = self._players.get(guild_id)
         if player is None:
             return
-        await player.set_pause(True)
+        try:
+            await player.set_pause(True)
+        except Exception as exc:
+            log_event(f"pause error guild={guild_id}: {exc}")
 
     async def resume(self, guild_id: int) -> None:
         player = self._players.get(guild_id)
         if player is None:
             return
-        await player.set_pause(False)
+        try:
+            await player.set_pause(False)
+        except Exception as exc:
+            log_event(f"resume error guild={guild_id}: {exc}")
 
     async def skip(self, guild_id: int) -> None:
         await self.stop(guild_id)
@@ -242,13 +330,19 @@ class LavalinkNodeBackend(AudioBackend):
         player = self._players.get(guild_id)
         if player is None:
             return
-        await player.set_volume(volume)
+        try:
+            await player.set_volume(volume)
+        except Exception as exc:
+            log_event(f"set_volume error guild={guild_id}: {exc}")
 
     async def is_playing(self, guild_id: int) -> bool:
         player = self._players.get(guild_id)
         if player is None:
             return False
-        return bool(player.is_playing() if callable(player.is_playing) else player.is_playing)
+        try:
+            return bool(player.is_playing() if callable(player.is_playing) else player.is_playing)
+        except Exception:
+            return False
 
     async def disconnect(self, guild_id: int) -> None:
         task = self._monitor_tasks.pop(guild_id, None)
@@ -258,33 +352,37 @@ class LavalinkNodeBackend(AudioBackend):
         player = self._players.pop(guild_id, None)
         if player is None:
             return
-        await player.destroy()
+        try:
+            await player.destroy()
+        except Exception as exc:
+            log_event(f"disconnect error guild={guild_id}: {exc}")
 
     # ------------------------------------------------------------------ #
     # -nodes 명령용
     # ------------------------------------------------------------------ #
     async def refresh_nodes(self):
         """노드 풀 재탐색 + pomice 노드 재등록. 재생 가능 노드(NodeInfo) 목록 반환."""
-        for task in list(self._monitor_tasks.values()):
-            task.cancel()
-        self._monitor_tasks.clear()
-        for guild_id, player in list(self._players.items()):
-            try:
-                await player.destroy()
-            except Exception:
-                pass
-        self._players.clear()
-
-        # 우리가 등록한 노드만 개별 해제(pomice NodePool.disconnect 의 KeyError 회피).
-        for nid in list(self._created):
-            pnode = self._pomice.NodePool._nodes.get(nid)
-            if pnode is not None:
+        async with self._register_lock:
+            for task in list(self._monitor_tasks.values()):
+                task.cancel()
+            self._monitor_tasks.clear()
+            for guild_id, player in list(self._players.items()):
                 try:
-                    await pnode.disconnect()  # 내부에서 _nodes 에서 자신을 제거
-                except Exception as exc:
-                    log_event(f"node disconnect error {nid}: {exc}")
-            self._pomice.NodePool._nodes.pop(nid, None)  # 잔여분 정리(안전)
-        self._created.clear()
+                    await player.destroy()
+                except Exception:
+                    pass
+            self._players.clear()
 
-        await self._register_pool_nodes()
-        return self._pool.healthy_nodes
+            # 우리가 등록한 노드만 개별 해제(pomice NodePool.disconnect 의 KeyError 회피).
+            for nid in list(self._created):
+                pnode = self._pomice.NodePool._nodes.get(nid)
+                if pnode is not None:
+                    try:
+                        await pnode.disconnect()  # 내부에서 _nodes 에서 자신을 제거
+                    except Exception as exc:
+                        log_event(f"node disconnect error {nid}: {exc}")
+                self._pomice.NodePool._nodes.pop(nid, None)  # 잔여분 정리(안전)
+            self._created.clear()
+
+            await self._register_pool_nodes()
+            return self._pool.healthy_nodes
