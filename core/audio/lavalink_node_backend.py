@@ -218,16 +218,23 @@ class LavalinkNodeBackend(AudioBackend):
                 and player.channel.id == voice_channel.id
             )
             if same_channel:
+                log_event(f"ensure_player reuse guild={guild_id} channel={voice_channel.id}")
                 self._players[guild_id] = player
                 return
             # 다른 채널이거나 stale 상태 → 깔끔히 끊고 새로 연결("Already connected" 방지).
+            log_event(f"ensure_player reconnect guild={guild_id} channel={voice_channel.id}")
             try:
                 await player.disconnect(force=True)
             except Exception:
                 pass
             self._players.pop(guild_id, None)
 
-        player = await voice_channel.connect(cls=self._pomice.Player)
+        try:
+            player = await voice_channel.connect(cls=self._pomice.Player)
+        except Exception as exc:
+            log_event(f"ensure_player connect failed guild={guild_id} channel={voice_channel.id}: {exc}")
+            raise
+        log_event(f"ensure_player connected guild={guild_id} channel={voice_channel.id} node={getattr(player.node, '_identifier', None)}")
         self._players[guild_id] = player
 
     async def get_tracks(self, query: str):
