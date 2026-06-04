@@ -16,8 +16,7 @@ from core.local.music.model import MusicModel
 from core.model.music_application import MusicApplication
 from core.network import YoutubePlaylist, YoutubeSearch
 from core.network.youtube.youtube_service import YoutubeService
-from embeds.music_embed import music_play_embed, music_pause_embed, music_stop_embed
-from views import get_music_view
+from views.music_layout import build_now_playing_view, build_idle_view
 MAX_GUILD_ACTION_PENDING = 5
 
 class Music(commands.Cog):
@@ -205,42 +204,23 @@ class Music(commands.Cog):
         if status is None or status.now_playing is None:
             return
         music = status.now_playing
-        if is_paused:
-            embed = music_pause_embed(
-                user_name=music.user_name,
-                user_icon=music.user_icon,
-                music_title=music.youtube_search.title,
-                music_thumbnail=music.youtube_search.thumbnail_url,
-                music_url=music.youtube_search.video_url,
-                isLoop=status.loop,
-            )
-        else:
-            embed = music_play_embed(
-                user_name=music.user_name,
-                user_icon=music.user_icon,
-                music_title=music.youtube_search.title,
-                music_thumbnail=music.youtube_search.thumbnail_url,
-                music_url=music.youtube_search.video_url,
-                isLoop=status.loop,
-            )
-        queue_preview = self.build_queue_preview(status.queue)
-        if queue_preview:
-            embed.add_field(name="대기열", value=queue_preview, inline=False)
-        await self.music_message_edit(
-            guild_id=guild_id,
-            embed=embed,
-            view=get_music_view(is_paused=is_paused, loop_enabled=status.loop)
+        view = build_now_playing_view(
+            user_name=music.user_name,
+            user_icon=music.user_icon,
+            music_title=music.youtube_search.title,
+            music_thumbnail=music.youtube_search.thumbnail_url,
+            music_url=music.youtube_search.video_url,
+            is_paused=is_paused,
+            is_loop=status.loop,
+            queue_preview=self.build_queue_preview(status.queue),
         )
+        await self.music_message_edit(guild_id=guild_id, view=view)
 
     async def _on_track_start(self, guild_id: int) -> None:
         await self.refresh_now_playing_embed(guild_id=guild_id, is_paused=False)
 
     async def _on_queue_empty(self, guild_id: int) -> None:
-        await self.music_message_edit(
-            guild_id=guild_id,
-            embed=music_stop_embed(),
-            view=None,
-        )
+        await self.music_message_edit(guild_id=guild_id, view=build_idle_view())
 
     async def load_local_guild_channel(self):
         local_default_channels = await MusicDataSource.get_all()
@@ -423,61 +403,43 @@ class Music(commands.Cog):
     async def clear_guild_queue(self, guild_id: int):
         await self.audio_service.stop(guild_id)
         await self.audio_service.disconnect(guild_id)
-        await self.music_message_edit(
-            guild_id=guild_id,
-            embed=music_stop_embed(),
-            view=None,
-        )
+        await self.music_message_edit(guild_id=guild_id, view=build_idle_view())
 
-    async def music_message_edit(
-        self,
-        *,
-        guild_id: int,
-        content: Optional[str] = MISSING,
-        embed: Optional[Embed] = MISSING,
-        embeds: Sequence[Embed] = MISSING,
-        attachments: Sequence[Union[Attachment, File]] = MISSING,
-        suppress: bool = False,
-        delete_after: Optional[float] = None,
-        allowed_mentions: Optional[AllowedMentions] = MISSING,
-        view: Optional[View] = MISSING,
-    ):
+    async def music_message_edit(self, *, guild_id: int, view: "discord.ui.LayoutView"):
+        # Components V2(LayoutView) 전용. v2 메시지는 content/embed 와 공존 불가하므로 view 만 보낸다.
         try:
             message = await self.get_channel_message(guild_id)
             if message is None:
                 log_event("music_message_edit aborted: channel/message fetch failed")
                 return
-            await message.edit(
-                content=content,
-                embed=embed,
-                embeds=embeds,
-                attachments=attachments,
-                suppress=suppress,
-                delete_after=delete_after,
-                allowed_mentions=allowed_mentions,
-                view=view
-            )
+            await message.edit(view=view)
         except discord.NotFound:
-            try:
-                channel = await self.bot.fetch_channel(self.guild_channel[guild_id].channel_id)
-                new_message = await channel.send(
-                    content=content,
-                    embed=embed,
-                    embeds=embeds,
-                    attachments=attachments,
-                    suppress_embeds=suppress,
-                    delete_after=delete_after,
-                    allowed_mentions=allowed_mentions,
-                    view=view
-                )
-                self.guild_channel[guild_id].message_id = new_message.id
-                await MusicDataSource.update_message_id(
-                    guild_id=guild_id,
-                    message_id=new_message.id,
-                )
-            except:
-                del self.guild_channel[guild_id]
-                await MusicDataSource.delete(guild_id)
+            # 메시지가 삭제됨 → 재생성
+            await self._recreate_music_message(guild_id, view)
+        except discord.HTTPException as exc:
+            # 기존 embed 메시지를 v2 로 in-place 변환 시 거부(400) → 옛 메시지 삭제 후 재생성. (그 외 일시 오류는 로그만)
+            if exc.status == 400:
+                log_event(f"music_message_edit 400 -> recreate: {exc}")
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                await self._recreate_music_message(guild_id, view)
+            else:
+                log_event(f"music_message_edit failed: {exc}")
+
+    async def _recreate_music_message(self, guild_id: int, view: "discord.ui.LayoutView"):
+        try:
+            channel = await self.bot.fetch_channel(self.guild_channel[guild_id].channel_id)
+            new_message = await channel.send(view=view)
+            self.guild_channel[guild_id].message_id = new_message.id
+            await MusicDataSource.update_message_id(
+                guild_id=guild_id,
+                message_id=new_message.id,
+            )
+        except Exception:
+            self.guild_channel.pop(guild_id, None)
+            await MusicDataSource.delete(guild_id)
 
     async def _pause(self, ctx: commands.Context | Interaction):
         self.check_voice_play(ctx)
@@ -527,7 +489,7 @@ class Music(commands.Cog):
 
     @app_commands.command(name="채널설정")
     async def set_channel(self, interaction: Interaction, channel: discord.TextChannel):
-        message = await channel.send(embed=music_stop_embed())
+        message = await channel.send(view=build_idle_view())
 
         if await MusicDataSource.get(interaction.guild_id) is not None:
             await MusicDataSource.update(
