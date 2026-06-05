@@ -1,5 +1,7 @@
 # project-music
 
+**English** | [한국어](README.ko.md)
+
 ## Setup
 - Create `.env` (see `.env.example`) and set `BOT_TOKEN`.
 - (Recommended) Create a venv: `python3 -m venv .venv && source .venv/bin/activate`
