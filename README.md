@@ -27,10 +27,25 @@ Audio backend selection (`AUDIO_BACKEND`):
 - `LAVALINK_IDENTIFIER=main`
 
 ### `lavalink-node` (public node pool) settings
-Fetches public nodes from the DarrenOfficial/lavalink-list REST API, checks which can play
-the configured source(s), and plays through them with ordered sticky failover (a working node
-stays selected until it fails, then the next node is tried).
-- `LAVALINK_LIST_URL=https://lavalink-list.ajieblogs.eu.org/All` — node list API (`/SSL`, `/NonSSL` also work)
+Fetches public nodes from one or both sources (a REST list API and/or a local JSON file), checks
+which can play the configured source(s), and plays through them with ordered sticky failover (a
+working node stays selected until it fails, then the next node is tried).
+
+Node list sources — a source is used **when its value is provided** (non-empty). If both are set
+they are merged and de-duplicated by host:port; if both are empty the pool is empty.
+- `LAVALINK_LIST_URL=https://lavalink-list.ajieblogs.eu.org/All` — node list API (`/SSL`, `/NonSSL`
+  also work). Has a default, so the URL source is on by default; set it empty to turn it off.
+- `LAVALINK_NODE_LIST_FILE=` — path to a local JSON node list (empty by default = off; set a path to
+  use it). Same schema as the list API — an array of
+  `{"identifier","host","port","password","secure","version"}`. Example:
+  ```json
+  [{"identifier":"lava-v4.ajieblogs.eu.org","host":"lava-v4.ajieblogs.eu.org","port":443,
+    "password":"https://dsc.gg/ajidevserver","secure":true,"version":"v4"}]
+  ```
+  This file is **git-ignored** (it's a local, curated list scraped from public-node pages such as
+  heavencloud.in). Copy the committed template `lavalink_nodes.example.json` to `lavalink_nodes.json`
+  and fill in real nodes. File nodes go through the **same** `secure-only` / v4 / probe filters as URL
+  nodes, so non-SSL entries are dropped unless `LAVALINK_NODE_SECURE_ONLY=false`.
 - `LAVALINK_NODE_PROBE_TIMEOUT=8` — total time budget (seconds) for the whole node check
   (list fetch + source probe + node connect, run in parallel). Lower = faster startup but drops slow nodes.
 - `LAVALINK_NODE_PROBE_QUERY=lofi hip hop` — YouTube probe search term

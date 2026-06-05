@@ -1,0 +1,18 @@
+[
+  {
+    "identifier": "example-ssl-node",
+    "host": "lava-v4.example.com",
+    "port": 443,
+    "password": "your-node-password",
+    "secure": true,
+    "version": "v4"
+  },
+  {
+    "identifier": "example-nonssl-node",
+    "host": "1.2.3.4",
+    "port": 2333,
+    "password": "youshallnotpass",
+    "secure": false,
+    "version": "v4"
+  }
+]

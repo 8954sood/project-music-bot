@@ -7,9 +7,17 @@ LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
 LAVALINK_IDENTIFIER = os.getenv("LAVALINK_IDENTIFIER", "main")
 
-# --- lavalink-node 엔진: 공개 노드 목록(DarrenOfficial/lavalink-list)을 받아와 풀로 운영 ---
-# 공식 REST API(10분마다 갱신, 온라인 노드만). /All, /SSL, /NonSSL 제공.
-LAVALINK_LIST_URL = os.getenv("LAVALINK_LIST_URL", "https://lavalink-list.ajieblogs.eu.org/All")
+# --- lavalink-node 엔진: 공개 노드 목록을 받아와 풀로 운영 ---
+# 노드 목록 소스는 "제공된 것"을 사용한다(값이 비어있지 않으면 사용). 둘 다 제공되면 합쳐서
+# (host,port) 중복제거, 둘 다 비면 빈 풀. secure-only/v4/probe 필터는 두 소스에 동일 적용.
+#
+# LAVALINK_LIST_URL: DarrenOfficial/lavalink-list REST API(10분마다 갱신, 온라인 노드만).
+#   /All, /SSL, /NonSSL 제공. 기본값이 있어 기본적으로 사용됨. 비우면(LAVALINK_LIST_URL=) URL 소스 끔.
+LAVALINK_LIST_URL = os.getenv("LAVALINK_LIST_URL", "https://lavalink-list.ajieblogs.eu.org/All").strip()
+# LAVALINK_NODE_LIST_FILE: 로컬 노드 목록 JSON 경로. lavalink-list API 와 동일 스키마의 배열:
+#   [{"identifier","host","port","password","secure","version"}, ...]
+#   기본값 없음(미제공) → 경로를 지정해야 파일 소스를 사용한다(opt-in).
+LAVALINK_NODE_LIST_FILE = os.getenv("LAVALINK_NODE_LIST_FILE", "").strip()
 # 각 노드의 YouTube 재생 가능 여부를 판별할 때 쓰는 loadtracks 요청 타임아웃(초)
 LAVALINK_NODE_PROBE_TIMEOUT = float(os.getenv("LAVALINK_NODE_PROBE_TIMEOUT", "8"))
 # 판별용 가벼운 고정 검색어 (ytsearch: 접두사 자동 부여)

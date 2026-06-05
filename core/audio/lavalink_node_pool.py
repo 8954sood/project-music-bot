@@ -25,6 +25,7 @@ failover 규칙
 from __future__ import annotations
 
 import asyncio
+import json
 import urllib.parse
 from dataclasses import dataclass
 from typing import Awaitable, Callable, List, Optional, TypeVar
@@ -33,6 +34,7 @@ import aiohttp
 
 from core.config import (
     LAVALINK_LIST_URL,
+    LAVALINK_NODE_LIST_FILE,
     LAVALINK_NODE_MAX_FAILOVER,
     LAVALINK_NODE_PROBE_QUERY,
     LAVALINK_NODE_PROBE_TIMEOUT,
@@ -123,43 +125,98 @@ class LavalinkNodePool:
     # ------------------------------------------------------------------ #
     # 1) 노드 목록 fetch
     # ------------------------------------------------------------------ #
-    async def fetch_nodes(self, *, timeout: Optional[float] = None) -> List[NodeInfo]:
-        """lavalink-list REST API 에서 노드 목록을 받아 v4 노드만 반환한다.
-
-        실패/타임아웃 시 빈 목록을 반환하고 로그를 남긴다(예외를 던지지 않음).
-        """
-        timeout = aiohttp.ClientTimeout(total=timeout or LAVALINK_NODE_PROBE_TIMEOUT)
+    async def _fetch_url_raw(self, *, timeout: Optional[float] = None) -> list:
+        """lavalink-list REST API 에서 raw JSON 배열을 받는다. 실패/비200 시 []."""
+        client_timeout = aiohttp.ClientTimeout(total=timeout or LAVALINK_NODE_PROBE_TIMEOUT)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(timeout=client_timeout) as session:
                 async with session.get(LAVALINK_LIST_URL) as resp:
                     if resp.status != 200:
-                        log_event(f"fetch_nodes HTTP {resp.status} from {LAVALINK_LIST_URL}")
-                        self._all = []
+                        log_event(f"fetch_nodes(url) HTTP {resp.status} from {LAVALINK_LIST_URL}")
                         return []
                     data = await resp.json(content_type=None)
         except Exception as exc:  # 네트워크/파싱 오류 전부 흡수
-            log_event(f"fetch_nodes failed: {exc}")
-            self._all = []
+            log_event(f"fetch_nodes(url) failed: {exc}")
             return []
+        return data if isinstance(data, list) else []
 
+    def _fetch_file_raw(self) -> list:
+        """로컬 JSON 파일(LAVALINK_NODE_LIST_FILE)에서 raw 배열을 읽는다.
+
+        파일 없음/깨짐/리스트 아님은 로그 후 [](URL 실패와 동일 톤). 디스크 I/O 라 동기 처리.
+        """
+        try:
+            with open(LAVALINK_NODE_LIST_FILE, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except FileNotFoundError:
+            log_event(f"fetch_nodes(file) not found: {LAVALINK_NODE_LIST_FILE}")
+            return []
+        except Exception as exc:
+            log_event(f"fetch_nodes(file) failed: {exc}")
+            return []
+        if not isinstance(data, list):
+            log_event(f"fetch_nodes(file) not a JSON array: {LAVALINK_NODE_LIST_FILE}")
+            return []
+        return data
+
+    def _parse_raw(self, raw_entries: list) -> List[NodeInfo]:
+        """raw dict 목록 → NodeInfo 목록. v4 + secure-only 필터를 일괄 적용(URL/파일 공통)."""
         nodes: List[NodeInfo] = []
-        for raw in data or []:
+        for raw in raw_entries or []:
             try:
                 node = NodeInfo.from_api(raw)
             except Exception as exc:
                 log_event(f"fetch_nodes skip malformed entry: {exc}")
                 continue
-            # pomice 미사용이지만 우리 v4 클라이언트도 v4 전용이므로 v4만 사용.
+            # 우리 v4 클라이언트는 v4 전용이므로 v4만 사용.
             if node.version.lower() != "v4":
                 continue
             # secure-only 모드면 non-secure 노드 제외 (음성 토큰 평문 노출 방지).
             if self._secure_only and not node.secure:
                 continue
             nodes.append(node)
+        return nodes
+
+    async def fetch_nodes(self, *, timeout: Optional[float] = None) -> List[NodeInfo]:
+        """제공된 소스(URL/파일)에서 노드 목록을 받아 v4 노드만 반환한다.
+
+        - 값이 제공된 소스만 사용한다: LAVALINK_LIST_URL 이 비어있지 않으면 URL,
+          LAVALINK_NODE_LIST_FILE 이 비어있지 않으면 파일. 둘 다 제공되면 합쳐서 (host,port) 중복제거.
+        - 실패/타임아웃은 소스별로 흡수하고, 어떤 소스도 노드를 못 주면 빈 목록을 반환한다(예외 없음).
+        """
+        use_url = bool(LAVALINK_LIST_URL)
+        use_file = bool(LAVALINK_NODE_LIST_FILE)
+
+        raw_entries: list = []
+        if use_url:
+            raw_entries += await self._fetch_url_raw(timeout=timeout)
+        if use_file:
+            raw_entries += self._fetch_file_raw()
+        if not use_url and not use_file:
+            log_event("fetch_nodes: 노드 소스 미제공(LAVALINK_LIST_URL/LAVALINK_NODE_LIST_FILE 모두 빈 값)")
+
+        parsed = self._parse_raw(raw_entries)
+
+        # (host,port) 기준 순서보존 중복제거 (URL+파일 병합 시 같은 노드 중복 방지).
+        seen = set()
+        nodes: List[NodeInfo] = []
+        for node in parsed:
+            key = (node.host, node.port)
+            if key in seen:
+                continue
+            seen.add(key)
+            nodes.append(node)
 
         self._all = nodes
         secure_note = " (secure-only)" if self._secure_only else ""
-        log_event(f"fetch_nodes ok: {len(nodes)} v4 nodes from list{secure_note}")
+        sources = []
+        if use_url:
+            sources.append("url")
+        if use_file:
+            sources.append("file")
+        log_event(
+            f"fetch_nodes ok: {len(nodes)} v4 nodes from [{','.join(sources) or 'none'}]{secure_note}"
+        )
         return nodes
 
     # ------------------------------------------------------------------ #
