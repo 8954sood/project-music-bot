@@ -27,3 +27,19 @@ LAVALINK_NODE_SECURE_ONLY = os.getenv("LAVALINK_NODE_SECURE_ONLY", "true").strip
 # 한 번의 재생/검색 요청에서 failover 로 시도할 최대 노드 수.
 #   과도한 재시도(여러 노드 연쇄 호출 → DDoS 유사)를 막는 상한. 0 이하면 무제한(healthy 전체).
 LAVALINK_NODE_MAX_FAILOVER = int(os.getenv("LAVALINK_NODE_MAX_FAILOVER", "3"))
+
+# 허용 소스 모드. youtube(기본) / spotify / both.
+#   - youtube : YouTube 검색·URL만. Spotify URL 은 차단(안내 후 자동삭제).
+#   - spotify : Spotify URL 만. YouTube 링크/텍스트 검색은 차단.
+#   - both    : Spotify URL + YouTube 검색·URL 둘 다.
+#   Spotify 재생은 "노드의 LavaSrc 플러그인"이 서버사이드에서 해석한다(클라 자격증명 불필요).
+#   노드는 모드별로 probe 해 해당 소스를 실제 처리하는 노드만 사용한다. both 는 둘 다 통과한 노드만.
+LAVALINK_NODE_SOURCE = os.getenv("LAVALINK_NODE_SOURCE", "youtube").strip().lower()
+if LAVALINK_NODE_SOURCE not in ("youtube", "spotify", "both"):
+    LAVALINK_NODE_SOURCE = "youtube"
+# 노드의 Spotify(LavaSrc) 지원 여부 판별에 쓰는 안정적인 공개 Spotify 트랙 URL.
+#   source 가 spotify/both 일 때만 사용된다.
+LAVALINK_NODE_SPOTIFY_PROBE_URL = os.getenv(
+    "LAVALINK_NODE_SPOTIFY_PROBE_URL",
+    "https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8",
+).strip()

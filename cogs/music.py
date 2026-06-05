@@ -19,6 +19,13 @@ from core.network.youtube.youtube_service import YoutubeService
 from views.music_layout import build_now_playing_view, build_idle_view
 MAX_GUILD_ACTION_PENDING = 5
 
+
+class SourceNotAllowed(Exception):
+    """현재 LAVALINK_NODE_SOURCE 모드에서 허용되지 않는 소스 입력.
+
+    메시지(str)는 사용자에게 그대로 노출되며, 호출부(on_message)에서 자동삭제 안내로 처리한다.
+    """
+
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -82,9 +89,26 @@ class Music(commands.Cog):
         # lavalink-node 엔진: 공개 노드 풀에서 직접 검색(loadtracks). sticky failover 사용.
         # ffmpeg 와 달리 yt-dlp/cookies.txt 가 필요 없다.
         backend = self.audio_service.backend
+        from core.config import LAVALINK_NODE_SOURCE
         from core.network.youtube.internal.youtube_utile import is_youtube_url
+        from core.util import is_spotify_url, is_spotify_collection_url
 
-        lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
+        # LAVALINK_NODE_SOURCE 모드 + 링크 판별로 분기. Spotify 는 URL 일 때만 재생되며,
+        # 노드의 LavaSrc 가 서버사이드에서 해석한다(클라 자격증명 없음).
+        if is_spotify_url(query):
+            if LAVALINK_NODE_SOURCE not in ("spotify", "both"):
+                raise SourceNotAllowed("스포티파이는 현재 모드에서 제공할 수 없습니다.")
+            lavalink_query = query  # Spotify URL 원본 그대로 (ytsearch prefix 미부착)
+            # 앨범/플레이리스트/아티스트는 전체 트랙 큐잉(Spotify 한정). 단일 트랙은 기존 limit 유지.
+            if is_spotify_collection_url(query):
+                limit = None
+        elif LAVALINK_NODE_SOURCE == "spotify":
+            if is_youtube_url(query):
+                raise SourceNotAllowed("유튜브는 현재 모드에서 제공할 수 없습니다.")
+            raise SourceNotAllowed("현재 모드에서는 Spotify 링크만 재생할 수 있어요.")
+        else:
+            # youtube / both 모드의 비-Spotify 입력: 기존 동작(YouTube 플레이리스트는 첫 곡만).
+            lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
         log_event(f"lavalink-node search query={lavalink_query}")
         start_time = time.monotonic()
         try:
@@ -130,8 +154,14 @@ class Music(commands.Cog):
             identifier = getattr(track, "identifier", "") or ""
             duration = getattr(track, "length", 0) or 0
             author = getattr(track, "author", "") or ""
-            thumbnail = getattr(track, "thumbnail", None)
-            if not thumbnail and identifier:
+            # pomice 의 thumbnail(YouTube 만 채워짐) → 없으면 원본 loadtracks info 의 artworkUrl
+            # (Spotify/LavaSrc 는 앨범 아트를 artworkUrl 로 주고 pomice 는 thumbnail 로 안 읽음).
+            info = getattr(track, "info", None) or {}
+            source = info.get("sourceName")
+            thumbnail = getattr(track, "thumbnail", None) or info.get("artworkUrl")
+            # 마지막 fallback(video id 로 YouTube 썸네일 추정)은 YouTube 소스에만 적용
+            # (Spotify identifier 로 만들면 깨진 URL 이 된다).
+            if not thumbnail and identifier and source in (None, "youtube"):
                 thumbnail = f"https://i.ytimg.com/vi/{identifier}/hqdefault.jpg"
             video_url = uri or (f"https://www.youtube.com/watch?v={identifier}" if identifier else "")
             return YoutubeSearch(
@@ -620,10 +650,15 @@ class Music(commands.Cog):
 
         await delete_message()
 
-        tracks, playlist_title, playlist_count = await self._search_tracks(message.content, message.author, limit=1)
-
         async def send_and_delete_message(content: str):
             await message.channel.send(content, delete_after=5)
+
+        try:
+            tracks, playlist_title, playlist_count = await self._search_tracks(message.content, message.author, limit=1)
+        except SourceNotAllowed as exc:
+            # 현재 모드에서 허용되지 않는 소스(예: youtube 모드에서 Spotify URL) → 안내 후 자동삭제.
+            await send_and_delete_message(str(exc))
+            return
 
         if not tracks:
             await send_and_delete_message("노래를 찾지 못했어요..")

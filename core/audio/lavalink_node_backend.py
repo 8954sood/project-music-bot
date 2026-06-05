@@ -27,7 +27,7 @@ import discord
 
 from core.audio.backend import AudioBackend, OnTrackEnd
 from core.audio.lavalink_node_pool import LavalinkNodePool, NodeInfo
-from core.config import LAVALINK_NODE_PROBE_TIMEOUT
+from core.config import LAVALINK_NODE_PROBE_TIMEOUT, LAVALINK_NODE_SOURCE
 from core.model.music_application import MusicApplication
 from core.util import log_event
 
@@ -89,7 +89,10 @@ class LavalinkNodeBackend(AudioBackend):
 
         # YouTube 판별 + 연결까지 통과한 노드만 failover 대상으로.
         self._pool.set_healthy([n for n in nodes if n.identifier in self._created])
-        log_event(f"lavalink-node: {len(self._created)}/{len(nodes)} pomice nodes connected")
+        log_event(
+            f"lavalink-node[{LAVALINK_NODE_SOURCE}]: "
+            f"{len(self._created)}/{len(nodes)} pomice nodes connected"
+        )
 
     async def _check_and_register(self, node: NodeInfo, deadline: float) -> Optional[str]:
         """노드 1개: YouTube 판별 → /version 연결 → ready 대기 → 버전보정. 성공 시 identifier.
@@ -102,9 +105,9 @@ class LavalinkNodeBackend(AudioBackend):
         loop = asyncio.get_event_loop()
         remaining = lambda: max(0.1, deadline - loop.time())  # noqa: E731
 
-        # 1) YouTube 재생 가능 판별
+        # 1) 재생 가능 판별 (LAVALINK_NODE_SOURCE 모드별: youtube / spotify / both)
         try:
-            ok = await self._pool.probe_youtube(node, timeout=remaining())
+            ok = await self._pool.probe_source(node, timeout=remaining())
         except Exception:
             ok = False
         if not ok:

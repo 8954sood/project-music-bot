@@ -37,6 +37,8 @@ from core.config import (
     LAVALINK_NODE_PROBE_QUERY,
     LAVALINK_NODE_PROBE_TIMEOUT,
     LAVALINK_NODE_SECURE_ONLY,
+    LAVALINK_NODE_SOURCE,
+    LAVALINK_NODE_SPOTIFY_PROBE_URL,
 )
 from core.util import log_event
 
@@ -44,6 +46,8 @@ T = TypeVar("T")
 
 # loadtracks 가 "재생 가능한 결과"로 간주하는 loadType 들 (Lavalink v4).
 _PLAYABLE_LOAD_TYPES = {"search", "track"}
+# Spotify URL 을 LavaSrc 가 해석했을 때 나오는 loadType 들 (단일=track, 앨범/플레이리스트=playlist).
+_SPOTIFY_PLAYABLE_LOAD_TYPES = {"track", "playlist", "search"}
 
 
 @dataclass
@@ -191,6 +195,52 @@ class LavalinkNodePool:
         log_event(f"probe {node.label} loadType={load_type} -> {'YES' if ok else 'NO'}")
         return ok
 
+    async def probe_spotify(self, node: NodeInfo, *, timeout: Optional[float] = None) -> bool:
+        """노드가 Spotify URL 을 LavaSrc 플러그인으로 해석하는지 /v4/loadtracks 로 확인.
+
+        Spotify 재생은 클라이언트(pomice) 가 아니라 노드의 LavaSrc 가 서버사이드에서 처리한다.
+        LavaSrc 가 없는 노드는 Spotify URL 에 빈/에러 응답을 주므로(probe_youtube 와 동일 판정)
+        이 판별을 통과한 노드만 spotify/both 모드에서 사용한다.
+        """
+        encoded = urllib.parse.quote(LAVALINK_NODE_SPOTIFY_PROBE_URL, safe="")
+        url = f"{node.rest_base}/v4/loadtracks?identifier={encoded}"
+        headers = {"Authorization": node.password}
+        timeout = aiohttp.ClientTimeout(total=timeout or LAVALINK_NODE_PROBE_TIMEOUT)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        log_event(f"probe(spotify) {node.label} HTTP {resp.status} -> NO")
+                        return False
+                    data = await resp.json(content_type=None)
+        except Exception as exc:
+            log_event(f"probe(spotify) {node.label} error: {exc} -> NO")
+            return False
+
+        load_type = (data or {}).get("loadType")
+        payload = (data or {}).get("data")
+        has_result = bool(payload) if not isinstance(payload, list) else len(payload) > 0
+        ok = load_type in _SPOTIFY_PLAYABLE_LOAD_TYPES and has_result
+        log_event(f"probe(spotify) {node.label} loadType={load_type} -> {'YES' if ok else 'NO'}")
+        return ok
+
+    async def probe_source(self, node: NodeInfo, *, timeout: Optional[float] = None) -> bool:
+        """LAVALINK_NODE_SOURCE 모드에 맞춰 노드의 재생 가능 여부를 판별한다.
+
+        - youtube : YouTube probe
+        - spotify : Spotify(LavaSrc) probe
+        - both    : 둘 다 통과해야 함(동시 실행 → 같은 timeout 예산 공유, 합산 아님)
+        """
+        if LAVALINK_NODE_SOURCE == "spotify":
+            return await self.probe_spotify(node, timeout=timeout)
+        if LAVALINK_NODE_SOURCE == "both":
+            yt_ok, sp_ok = await asyncio.gather(
+                self.probe_youtube(node, timeout=timeout),
+                self.probe_spotify(node, timeout=timeout),
+            )
+            return bool(yt_ok) and bool(sp_ok)
+        return await self.probe_youtube(node, timeout=timeout)
+
     # ------------------------------------------------------------------ #
     # 3) 재탐색 (시작 시 자동 / -nodes 명령 / 재시작)
     # ------------------------------------------------------------------ #
@@ -206,14 +256,14 @@ class LavalinkNodePool:
             return []
 
         results = await asyncio.gather(
-            *(self.probe_youtube(node) for node in self._all),
+            *(self.probe_source(node) for node in self._all),
             return_exceptions=True,
         )
         healthy = [node for node, ok in zip(self._all, results) if ok is True]
 
         self._healthy = healthy
         self._current_index = 0  # 재탐색 = sticky 리셋
-        log_event(f"discover: {len(healthy)}/{len(self._all)} nodes can play YouTube")
+        log_event(f"discover[{LAVALINK_NODE_SOURCE}]: {len(healthy)}/{len(self._all)} playable nodes")
         return list(healthy)
 
     def reset(self) -> None:

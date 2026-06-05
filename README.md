@@ -28,19 +28,37 @@ Audio backend selection (`AUDIO_BACKEND`):
 
 ### `lavalink-node` (public node pool) settings
 Fetches public nodes from the DarrenOfficial/lavalink-list REST API, checks which can play
-YouTube, and plays through them with ordered sticky failover (a working node stays selected
-until it fails, then the next node is tried).
+the configured source(s), and plays through them with ordered sticky failover (a working node
+stays selected until it fails, then the next node is tried).
 - `LAVALINK_LIST_URL=https://lavalink-list.ajieblogs.eu.org/All` — node list API (`/SSL`, `/NonSSL` also work)
 - `LAVALINK_NODE_PROBE_TIMEOUT=8` — total time budget (seconds) for the whole node check
-  (list fetch + YouTube probe + node connect, run in parallel). Lower = faster startup but drops slow nodes.
-- `LAVALINK_NODE_PROBE_QUERY=lofi hip hop` — probe search term
+  (list fetch + source probe + node connect, run in parallel). Lower = faster startup but drops slow nodes.
+- `LAVALINK_NODE_PROBE_QUERY=lofi hip hop` — YouTube probe search term
 - `LAVALINK_NODE_SECURE_ONLY=true` — only use secure (wss) nodes. Recommended on, since non-secure
   nodes transmit the Discord voice token in plaintext. (The bot token is never sent to nodes.)
 - `LAVALINK_NODE_MAX_FAILOVER=3` — max nodes to try per play/search request before giving up
   (prevents hammering every node). A new request gets a fresh budget. `0` = unlimited.
+- `LAVALINK_NODE_SOURCE=youtube` — which sources to allow (see below): `youtube` / `spotify` / `both`
+- `LAVALINK_NODE_SPOTIFY_PROBE_URL=https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8` — the
+  Spotify track URL used to probe whether a node has the LavaSrc plugin (only used when the source
+  includes Spotify).
 
-Only nodes that pass both the YouTube probe and pomice's `/version` check are used; flaky nodes are
-skipped automatically and re-evaluated on restart / `-nodes`.
+Only nodes that pass the source probe(s) for the active mode **and** pomice's `/version` check are
+used; flaky nodes are skipped automatically and re-evaluated on restart / `-nodes`.
+
+#### Source modes (`LAVALINK_NODE_SOURCE`)
+Spotify on public nodes works **server-side via the node's LavaSrc plugin** — the bot sends the
+Spotify URL to the node's `loadtracks` and LavaSrc resolves/mirrors it (no Spotify API credentials
+needed on the bot). Not every public node has LavaSrc, so the bot probes each node for Spotify
+support and only keeps capable ones. **Spotify only plays from an explicit Spotify URL** (track /
+album / playlist / artist link); plain-text searches never go to Spotify.
+
+- `youtube` (default) — YouTube only. Pasting a Spotify URL replies
+  "스포티파이는 현재 모드에서 제공할 수 없습니다." and auto-deletes. (Unchanged from before.)
+- `spotify` — Spotify URLs only. A YouTube link replies "유튜브는 현재 모드에서 제공할 수 없습니다.",
+  and a plain-text search replies "현재 모드에서는 Spotify 링크만 재생할 수 있어요." Both auto-delete.
+- `both` — Spotify URLs play, and YouTube links / text searches behave as usual. Note that `both`
+  keeps only nodes that support *both* sources, so the healthy pool can be smaller.
 
 ## Commands
 - `-reload [cog]` (owner) — reload cogs
@@ -51,6 +69,11 @@ skipped automatically and re-evaluated on restart / `-nodes`.
   track locally via yt-dlp + ffplay (a stand-in for Discord voice; Lavalink can't output to local
   speakers). Run by path; `python -m test.lavalink_node_test` won't work (the root `test.py` shadows
   the `test` package).
+- `python test/lavalink_node_spotify_test.py` — probe each public node for YouTube and Spotify
+  (LavaSrc) support over pure REST (no Discord/pomice), print a per-node table and the predicted
+  healthy-pool size for each `LAVALINK_NODE_SOURCE` mode. Optionally paste a Spotify URL to confirm a
+  node actually resolves it. Use this to check whether `spotify`/`both` modes are viable on the
+  current public node list before switching the bot over. Run by path (same `test.py` shadowing caveat).
 
 ## Notes
 - Keep command UX unchanged; all playback logic is routed through `core/audio` and `AudioService`.
