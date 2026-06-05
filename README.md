@@ -31,10 +31,13 @@ Fetches public nodes from the DarrenOfficial/lavalink-list REST API, checks whic
 YouTube, and plays through them with ordered sticky failover (a working node stays selected
 until it fails, then the next node is tried).
 - `LAVALINK_LIST_URL=https://lavalink-list.ajieblogs.eu.org/All` — node list API (`/SSL`, `/NonSSL` also work)
-- `LAVALINK_NODE_PROBE_TIMEOUT=8` — per-request timeout (seconds) for node fetch / YouTube probe
+- `LAVALINK_NODE_PROBE_TIMEOUT=8` — total time budget (seconds) for the whole node check
+  (list fetch + YouTube probe + node connect, run in parallel). Lower = faster startup but drops slow nodes.
 - `LAVALINK_NODE_PROBE_QUERY=lofi hip hop` — probe search term
 - `LAVALINK_NODE_SECURE_ONLY=true` — only use secure (wss) nodes. Recommended on, since non-secure
   nodes transmit the Discord voice token in plaintext. (The bot token is never sent to nodes.)
+- `LAVALINK_NODE_MAX_FAILOVER=3` — max nodes to try per play/search request before giving up
+  (prevents hammering every node). A new request gets a fresh budget. `0` = unlimited.
 
 Only nodes that pass both the YouTube probe and pomice's `/version` check are used; flaky nodes are
 skipped automatically and re-evaluated on restart / `-nodes`.

@@ -33,6 +33,7 @@ import aiohttp
 
 from core.config import (
     LAVALINK_LIST_URL,
+    LAVALINK_NODE_MAX_FAILOVER,
     LAVALINK_NODE_PROBE_QUERY,
     LAVALINK_NODE_PROBE_TIMEOUT,
     LAVALINK_NODE_SECURE_ONLY,
@@ -241,15 +242,19 @@ class LavalinkNodePool:
         비어 음악이 멈춘다. 그래서 실패 노드를 영구 제거하지 않고 **이번 시도에서만 건너뛰고 다음 재생에서
         다시 시도**한다. 노드 목록 자체의 갱신(죽은 노드 제거)은 discover()(재시작 / -nodes)가 담당한다.
         동시 호출(검색+재생 등)에도 안전하도록 노드 리스트 스냅샷으로 순회한다.
+
+        과도한 재시도 방지: 한 호출에서 최대 LAVALINK_NODE_MAX_FAILOVER(기본 3)개 노드까지만 시도하고,
+        그 안에 성공 못 하면 이번 요청은 포기(RuntimeError)한다. 다음(새) 요청은 다시 새 예산으로 시작.
         """
         nodes = list(self._healthy)  # 스냅샷: 동시 호출/리스트 변경에 안전
         n = len(nodes)
         if n == 0:
             raise RuntimeError("사용 가능한 Lavalink 노드가 없습니다. (discover 필요)")
 
+        limit = n if LAVALINK_NODE_MAX_FAILOVER <= 0 else min(LAVALINK_NODE_MAX_FAILOVER, n)
         start = self._current_index % n
         last_error: Optional[Exception] = None
-        for offset in range(n):
+        for offset in range(limit):
             node = nodes[(start + offset) % n]
             try:
                 result = await action(node)
@@ -267,5 +272,5 @@ class LavalinkNodePool:
             return result
 
         raise RuntimeError(
-            f"모든 노드 failover 실패 ({n}개 시도). 마지막 오류: {last_error}"
+            f"failover 실패 ({limit}/{n}개 노드 시도, 최대 {LAVALINK_NODE_MAX_FAILOVER}). 마지막 오류: {last_error}"
         )

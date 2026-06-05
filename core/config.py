@@ -24,3 +24,6 @@ LAVALINK_NODE_SECURE_ONLY = os.getenv("LAVALINK_NODE_SECURE_ONLY", "true").strip
     "yes",
     "on",
 )
+# 한 번의 재생/검색 요청에서 failover 로 시도할 최대 노드 수.
+#   과도한 재시도(여러 노드 연쇄 호출 → DDoS 유사)를 막는 상한. 0 이하면 무제한(healthy 전체).
+LAVALINK_NODE_MAX_FAILOVER = int(os.getenv("LAVALINK_NODE_MAX_FAILOVER", "3"))
