@@ -38,6 +38,9 @@ stays selected until it fails, then the next node is tried).
   nodes transmit the Discord voice token in plaintext. (The bot token is never sent to nodes.)
 - `LAVALINK_NODE_MAX_FAILOVER=3` — max nodes to try per play/search request before giving up
   (prevents hammering every node). A new request gets a fresh budget. `0` = unlimited.
+- `LAVALINK_NODE_REFRESH_HOURS=24` — auto re-discover the public node pool on this interval
+  (public nodes die/recover over time). A refresh destroys all players, so any cycle where a guild is
+  connected to voice ("in use") is skipped and retried next interval. `0` disables (manual `-nodes` only).
 - `LAVALINK_NODE_SOURCE=youtube` — which sources to allow (see below): `youtube` / `spotify` / `both`
 - `LAVALINK_NODE_SPOTIFY_PROBE_URL=https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8` — the
   Spotify track URL used to probe whether a node has the LavaSrc plugin (only used when the source

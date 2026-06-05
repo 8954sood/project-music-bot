@@ -43,3 +43,7 @@ LAVALINK_NODE_SPOTIFY_PROBE_URL = os.getenv(
     "LAVALINK_NODE_SPOTIFY_PROBE_URL",
     "https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8",
 ).strip()
+# 공개 노드 풀 자동 재탐색 주기(시간). 공개 노드는 수시로 죽고 살아나므로 주기적으로 갱신한다.
+#   재탐색은 모든 player 를 파괴하므로, 어느 길드든 음성에 연결돼 "사용 중"이면 그 주기는 건너뛴다.
+#   0 이하면 자동 재탐색 비활성( -nodes 수동 갱신만 ).
+LAVALINK_NODE_REFRESH_HOURS = float(os.getenv("LAVALINK_NODE_REFRESH_HOURS", "24"))

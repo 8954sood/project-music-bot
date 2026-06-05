@@ -84,3 +84,7 @@ class FFmpegBackend(AudioBackend):
             await player.disconnect()
         except Exception:
             pass
+
+    async def close(self) -> None:
+        # 등록한 백그라운드 작업이 없어 정리할 것 없음.
+        pass

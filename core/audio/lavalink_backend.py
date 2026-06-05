@@ -133,3 +133,7 @@ class LavalinkBackend(AudioBackend):
         if player is None:
             return
         await player.destroy()
+
+    async def close(self) -> None:
+        # 단일 자체호스팅 노드. 등록한 상시 백그라운드 작업이 없어 정리할 것 없음.
+        pass

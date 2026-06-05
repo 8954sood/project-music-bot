@@ -37,6 +37,10 @@ class AudioService:
     async def connect(self, bot: discord.Client) -> None:
         await self.backend.connect(bot)
 
+    async def close(self) -> None:
+        """백엔드가 등록한 백그라운드 작업 정리(cog 언로드/리로드 시)."""
+        await self.backend.close()
+
     def _get_lock(self, guild_id: int) -> asyncio.Lock:
         lock = self._locks.get(guild_id)
         if lock is None:

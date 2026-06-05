@@ -38,6 +38,15 @@ class Music(commands.Cog):
         self.audio_service.on_queue_empty = self._on_queue_empty
         asyncio.run_coroutine_threadsafe(self.load_local_guild_channel(), self.bot.loop)
 
+    async def cog_unload(self):
+        # cog 언로드/리로드(-reload) 시 호출되는 discord.py 라이프사이클 훅.
+        # 이 인스턴스가 등록한 백그라운드 작업(노드 정기 재탐색 루프, 트랙 모니터)을 취소해
+        # 새 인스턴스와 중복 실행/누수되지 않게 한다.
+        try:
+            await self.audio_service.close()
+        except Exception as exc:
+            log_event(f"Music.cog_unload close error: {exc}")
+
     def build_queue_preview(self, queue: List[MusicApplication], max_items: int = 5) -> Optional[str]:
         if not queue:
             return None

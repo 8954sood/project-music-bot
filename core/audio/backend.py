@@ -51,3 +51,11 @@ class AudioBackend(ABC):
     @abstractmethod
     async def disconnect(self, guild_id: int) -> None:
         pass
+
+    @abstractmethod
+    async def close(self) -> None:
+        """백엔드가 등록한 백그라운드 작업 정리(cog 언로드/리로드 시 호출).
+
+        정리할 게 없는 백엔드는 빈 구현(pass)을 둔다.
+        """
+        pass

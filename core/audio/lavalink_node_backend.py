@@ -27,7 +27,11 @@ import discord
 
 from core.audio.backend import AudioBackend, OnTrackEnd
 from core.audio.lavalink_node_pool import LavalinkNodePool, NodeInfo
-from core.config import LAVALINK_NODE_PROBE_TIMEOUT, LAVALINK_NODE_SOURCE
+from core.config import (
+    LAVALINK_NODE_PROBE_TIMEOUT,
+    LAVALINK_NODE_REFRESH_HOURS,
+    LAVALINK_NODE_SOURCE,
+)
 from core.model.music_application import MusicApplication
 from core.util import log_event
 
@@ -46,6 +50,7 @@ class LavalinkNodeBackend(AudioBackend):
         self._monitor_tasks: Dict[int, asyncio.Task] = {}
         self._created: Set[str] = set()  # create_node 성공한 노드 identifier
         self._register_lock = asyncio.Lock()  # discover/등록 동시 실행 직렬화
+        self._refresh_task: Optional[asyncio.Task] = None  # 주기적 노드 재탐색 루프
 
     # ------------------------------------------------------------------ #
     # 수명주기
@@ -54,6 +59,54 @@ class LavalinkNodeBackend(AudioBackend):
         self._bot = bot
         async with self._register_lock:
             await self._register_pool_nodes()
+        # 공개 노드는 수시로 죽고 살아나므로 주기적으로(기본 24h) 재탐색한다. 시작 시 1회만 띄움.
+        if self._refresh_task is None and LAVALINK_NODE_REFRESH_HOURS > 0:
+            self._refresh_task = asyncio.create_task(self._periodic_refresh_loop())
+
+    async def close(self) -> None:
+        """등록한 백그라운드 작업(정기 재탐색 루프 + 트랙 종료 모니터들)을 취소한다.
+
+        cog 언로드/리로드(Music.cog_unload) 시 호출되어, 이전 인스턴스의 작업이 새 인스턴스와
+        함께 중복 실행되며 누수되는 것을 막는다. 음성 연결(player) 자체는 건드리지 않는다.
+        """
+        task = self._refresh_task
+        self._refresh_task = None
+        if task is not None:
+            task.cancel()
+
+        for monitor in list(self._monitor_tasks.values()):
+            monitor.cancel()
+        self._monitor_tasks.clear()
+
+    def _in_use(self) -> bool:
+        """어느 길드든 음성에 연결된 player 가 있으면 '사용 중'으로 본다(재탐색은 player 를 파괴하므로)."""
+        for player in self._players.values():
+            try:
+                if self._is_connected(player):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def _periodic_refresh_loop(self) -> None:
+        """LAVALINK_NODE_REFRESH_HOURS 마다 노드 풀을 재탐색한다.
+
+        단, 재탐색은 모든 player 를 파괴(재생 중단)하므로 '사용 중'인 주기는 건너뛰고 다음 주기로 미룬다.
+        """
+        interval = LAVALINK_NODE_REFRESH_HOURS * 3600
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            if self._in_use():
+                log_event("lavalink-node: periodic refresh skipped (in use)")
+                continue
+            try:
+                healthy = await self.refresh_nodes()
+                log_event(f"lavalink-node: periodic refresh done, {len(healthy)} healthy nodes")
+            except Exception as exc:
+                log_event(f"lavalink-node: periodic refresh failed: {exc}")
 
     def _available_nodes(self):
         return [n for n in self._pomice.NodePool._nodes.values() if getattr(n, "_available", False)]

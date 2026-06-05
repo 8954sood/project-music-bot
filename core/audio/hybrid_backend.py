@@ -58,3 +58,6 @@ class HybridBackend(AudioBackend):
 
     async def disconnect(self, guild_id: int) -> None:
         await self._ffmpeg.disconnect(guild_id)
+
+    async def close(self) -> None:
+        await self._ffmpeg.close()
