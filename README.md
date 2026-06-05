@@ -33,10 +33,11 @@ Fetches public nodes from one or both sources (a REST list API and/or a local JS
 which can play the configured source(s), and plays through them with ordered sticky failover (a
 working node stays selected until it fails, then the next node is tried).
 
-Node list sources — a source is used **when its value is provided** (non-empty). If both are set
-they are merged and de-duplicated by host:port; if both are empty the pool is empty.
-- `LAVALINK_LIST_URL=https://lavalink-list.ajieblogs.eu.org/All` — node list API (`/SSL`, `/NonSSL`
-  also work). Has a default, so the URL source is on by default; set it empty to turn it off.
+Node list sources — a source is used **when its value is provided** (non-empty). Neither has a
+default, so set at least one. If both are set they are merged and de-duplicated by host:port; if
+both are empty the pool is empty.
+- `LAVALINK_NODE_LIST_URL=` — node list API URL (empty by default = off). Recommended value:
+  `https://lavalink-list.ajieblogs.eu.org/All` (`/SSL`, `/NonSSL` also work).
 - `LAVALINK_NODE_LIST_FILE=` — path to a local JSON node list (empty by default = off; set a path to
   use it). Same schema as the list API — an array of
   `{"identifier","host","port","password","secure","version"}`. Example:

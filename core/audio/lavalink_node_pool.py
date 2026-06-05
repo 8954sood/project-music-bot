@@ -33,7 +33,7 @@ from typing import Awaitable, Callable, List, Optional, TypeVar
 import aiohttp
 
 from core.config import (
-    LAVALINK_LIST_URL,
+    LAVALINK_NODE_LIST_URL,
     LAVALINK_NODE_LIST_FILE,
     LAVALINK_NODE_MAX_FAILOVER,
     LAVALINK_NODE_PROBE_QUERY,
@@ -130,9 +130,9 @@ class LavalinkNodePool:
         client_timeout = aiohttp.ClientTimeout(total=timeout or LAVALINK_NODE_PROBE_TIMEOUT)
         try:
             async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.get(LAVALINK_LIST_URL) as resp:
+                async with session.get(LAVALINK_NODE_LIST_URL) as resp:
                     if resp.status != 200:
-                        log_event(f"fetch_nodes(url) HTTP {resp.status} from {LAVALINK_LIST_URL}")
+                        log_event(f"fetch_nodes(url) HTTP {resp.status} from {LAVALINK_NODE_LIST_URL}")
                         return []
                     data = await resp.json(content_type=None)
         except Exception as exc:  # 네트워크/파싱 오류 전부 흡수
@@ -180,11 +180,11 @@ class LavalinkNodePool:
     async def fetch_nodes(self, *, timeout: Optional[float] = None) -> List[NodeInfo]:
         """제공된 소스(URL/파일)에서 노드 목록을 받아 v4 노드만 반환한다.
 
-        - 값이 제공된 소스만 사용한다: LAVALINK_LIST_URL 이 비어있지 않으면 URL,
+        - 값이 제공된 소스만 사용한다: LAVALINK_NODE_LIST_URL 이 비어있지 않으면 URL,
           LAVALINK_NODE_LIST_FILE 이 비어있지 않으면 파일. 둘 다 제공되면 합쳐서 (host,port) 중복제거.
         - 실패/타임아웃은 소스별로 흡수하고, 어떤 소스도 노드를 못 주면 빈 목록을 반환한다(예외 없음).
         """
-        use_url = bool(LAVALINK_LIST_URL)
+        use_url = bool(LAVALINK_NODE_LIST_URL)
         use_file = bool(LAVALINK_NODE_LIST_FILE)
 
         raw_entries: list = []
@@ -193,7 +193,7 @@ class LavalinkNodePool:
         if use_file:
             raw_entries += self._fetch_file_raw()
         if not use_url and not use_file:
-            log_event("fetch_nodes: 노드 소스 미제공(LAVALINK_LIST_URL/LAVALINK_NODE_LIST_FILE 모두 빈 값)")
+            log_event("fetch_nodes: 노드 소스 미제공(LAVALINK_NODE_LIST_URL/LAVALINK_NODE_LIST_FILE 모두 빈 값)")
 
         parsed = self._parse_raw(raw_entries)
 

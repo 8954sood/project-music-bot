@@ -139,7 +139,7 @@ async def main() -> None:
     print("=== 1) 노드 목록 fetch (secure-only / v4) ===")
     nodes = await pool.fetch_nodes()
     if not nodes:
-        print("노드 목록을 받지 못했습니다. (LAVALINK_LIST_URL / 네트워크 확인) 종료.")
+        print("노드 목록을 받지 못했습니다. (LAVALINK_NODE_LIST_URL / 네트워크 확인) 종료.")
         return
     print(f"총 {len(nodes)}개 노드 수신\n")
     print(f"Spotify probe URL: {probe_url}\n")

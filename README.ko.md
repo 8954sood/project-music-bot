@@ -33,10 +33,10 @@ macOS 전용 (Opus 음성 라이브러리):
 있는 노드를 판별하고, 순서 기반 sticky failover로 재생한다(작동하는 노드는 실패할 때까지 유지되고,
 실패하면 다음 노드로 넘어감).
 
-노드 목록 소스 — 값이 **제공되면(비어있지 않으면)** 해당 소스를 사용한다. 둘 다 설정되면 합쳐서
-host:port로 중복 제거하고, 둘 다 비면 빈 풀이 된다.
-- `LAVALINK_LIST_URL=https://lavalink-list.ajieblogs.eu.org/All` — 노드 목록 API (`/SSL`, `/NonSSL`도
-  가능). 기본값이 있어 기본적으로 사용됨. 비우면(`LAVALINK_LIST_URL=`) URL 소스 끔.
+노드 목록 소스 — 값이 **제공되면(비어있지 않으면)** 해당 소스를 사용한다. 둘 다 기본값이 없으므로
+최소 하나는 지정해야 한다. 둘 다 설정되면 합쳐서 host:port로 중복 제거하고, 둘 다 비면 빈 풀이 된다.
+- `LAVALINK_NODE_LIST_URL=` — 노드 목록 API URL(기본 빈 값 = 끔). 권장값:
+  `https://lavalink-list.ajieblogs.eu.org/All` (`/SSL`, `/NonSSL`도 가능).
 - `LAVALINK_NODE_LIST_FILE=` — 로컬 JSON 노드 목록 경로(기본 빈 값 = 끔; 경로를 지정해야 사용).
   목록 API와 동일 스키마 —
   `{"identifier","host","port","password","secure","version"}` 배열. 예:
