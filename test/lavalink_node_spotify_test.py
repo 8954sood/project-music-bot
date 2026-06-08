@@ -43,6 +43,8 @@ import urllib.parse
 import aiohttp
 from dotenv import load_dotenv
 
+load_dotenv()
+
 # 프로젝트 루트를 import 경로에 추가 (python test/..._test.py 로 직접 실행 가능하도록)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -130,7 +132,6 @@ async def resolve_spotify_on_node(node: NodeInfo, query: str, *, timeout: float)
 
 
 async def main() -> None:
-    load_dotenv()
     timeout = LAVALINK_NODE_PROBE_TIMEOUT
     probe_url = spotify_probe_url()
 

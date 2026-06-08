@@ -36,6 +36,8 @@ import urllib.parse
 import aiohttp
 from dotenv import load_dotenv
 
+load_dotenv()
+
 # 프로젝트 루트를 import 경로에 추가 (python test/lavalink_node_test.py 로 실행 가능하도록)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -126,7 +128,6 @@ def make_action(query: str):
 
 
 async def main() -> None:
-    load_dotenv()
     pool = LavalinkNodePool()
 
     print("=== 1) 노드 탐색 + YouTube 재생 가능 판별 ===")
