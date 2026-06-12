@@ -48,6 +48,15 @@ class AudioService:
             self._locks[guild_id] = lock
         return lock
 
+    @staticmethod
+    def _consume_callback_task(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log_event(f"audio callback failed: {exc}")
+
     def has_state(self, guild_id: int) -> bool:
         return guild_id in self.states
 
@@ -135,6 +144,8 @@ class AudioService:
 
             try:
                 await self.backend.play(guild_id, next_track, self._on_track_end(guild_id, next_track))
+                if next_track.startup_timer:
+                    next_track.startup_timer.mark("playback_start")
                 start_time = self._play_start_times.pop(guild_id, None)
                 if start_time is not None:
                     elapsed_ms = (time.monotonic() - start_time) * 1000
@@ -147,7 +158,10 @@ class AudioService:
                         state.now_playing = next_track
                         state.is_paused = False
                 if self.on_track_start:
-                    await self.on_track_start(guild_id)
+                    if next_track.startup_timer:
+                        next_track.startup_timer.mark("refresh_scheduled")
+                    callback_task = asyncio.create_task(self.on_track_start(guild_id))
+                    callback_task.add_done_callback(self._consume_callback_task)
                 return
             except Exception as exc:
                 log_event(f"play_next failed: {exc}")

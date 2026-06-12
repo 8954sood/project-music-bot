@@ -47,6 +47,7 @@ class LavalinkNodeBackend(AudioBackend):
         self._pool = LavalinkNodePool()
         self._bot: Optional[discord.Client] = None
         self._players: Dict[int, "pomice.Player"] = {}
+        self._track_nodes: Dict[int, str] = {}
         self._monitor_tasks: Dict[int, asyncio.Task] = {}
         self._created: Set[str] = set()  # create_node 성공한 노드 identifier
         self._register_lock = asyncio.Lock()  # discover/등록 동시 실행 직렬화
@@ -303,9 +304,34 @@ class LavalinkNodeBackend(AudioBackend):
         """
         async def action(node: NodeInfo):
             target = self._pomice.NodePool.get_node(identifier=node.identifier)
-            return await target.get_tracks(query=query)
+            results = await target.get_tracks(query=query)
+            self._tag_tracks_with_node(results, node.identifier)
+            return results
 
         return await self._pool.run_with_failover(action)
+
+    @staticmethod
+    def _result_tracks(results):
+        if results is None:
+            return []
+        if isinstance(results, list):
+            return results
+        if hasattr(results, "tracks"):
+            return list(results.tracks)
+        return [results]
+
+    def _tag_tracks_with_node(self, results, node_identifier: str) -> None:
+        for track in self._result_tracks(results):
+            self._track_nodes[id(track)] = node_identifier
+            try:
+                setattr(track, "_music_bot_node_identifier", node_identifier)
+            except (AttributeError, TypeError):
+                pass
+
+    def track_node_identifier(self, track) -> Optional[str]:
+        tagged = getattr(track, "_music_bot_node_identifier", None)
+        stored = self._track_nodes.pop(id(track), None)
+        return tagged or stored
 
     async def play(self, guild_id: int, track: MusicApplication, on_end: OnTrackEnd) -> None:
         player = self._players.get(guild_id)
@@ -317,20 +343,54 @@ class LavalinkNodeBackend(AudioBackend):
             if player.node is None or player.node._identifier != node.identifier:
                 await self._swap_to(player, target)
 
-            results = await player.get_tracks(query=track.youtube_search.video_url)
-            if results is None:
-                raise RuntimeError("노드가 트랙을 찾지 못함")
-            if isinstance(results, list):
-                tracks = results
-            elif hasattr(results, "tracks"):
-                tracks = list(results.tracks)
-            else:
-                tracks = []
-            if not tracks:
-                raise RuntimeError("노드가 트랙을 찾지 못함")
+            timer = track.startup_timer
+            prepared = track.lavalink_track
+            prepared_node = track.lavalink_node_identifier
+            same_node = prepared_node is None or prepared_node == node.identifier
+            fallback_reason = None
 
-            await player.play(track=tracks[0])
+            if prepared is not None and same_node:
+                try:
+                    if timer:
+                        timer.mark("backend_play_start", node=node.identifier)
+                        timer.mark("prepared_track_used", node=node.identifier)
+                    log_event(
+                        "lavalink-node play using prepared track "
+                        f"guild={guild_id} node={node.label} title={track.youtube_search.title}"
+                    )
+                    await player.play(track=prepared)
+                except Exception as exc:
+                    fallback_reason = "prepared_track_failed"
+                    log_event(
+                        "lavalink-node play fallback direct load "
+                        f"guild={guild_id} node={node.label} "
+                        f"reason={fallback_reason} error={type(exc).__name__}"
+                    )
+            else:
+                fallback_reason = (
+                    "missing_prepared_track" if prepared is None else "prepared_track_node_mismatch"
+                )
+                if timer:
+                    timer.mark("backend_play_start", node=node.identifier)
+                log_event(
+                    "lavalink-node play fallback direct load "
+                    f"guild={guild_id} node={node.label} reason={fallback_reason}"
+                )
+
+            if fallback_reason is not None:
+                if timer:
+                    timer.mark("direct_load_fallback_start", reason=fallback_reason)
+                results = await player.get_tracks(query=track.youtube_search.video_url)
+                tracks = self._result_tracks(results)
+                if not tracks:
+                    raise RuntimeError("노드가 트랙을 찾지 못함")
+                if timer:
+                    timer.mark("direct_load_fallback_done", reason=fallback_reason)
+                await player.play(track=tracks[0])
+
             self._start_monitor(guild_id, player, on_end)
+            if timer:
+                timer.mark("backend_play_done", node=node.identifier)
             log_event(
                 f"lavalink-node play guild={guild_id} node={node.label} title={track.youtube_search.title}"
             )

@@ -1,6 +1,8 @@
 .env
 .venv
 .venv-test
+venv/
+.pytest_cache/
 path
 db.sqlite
 .DS_Store

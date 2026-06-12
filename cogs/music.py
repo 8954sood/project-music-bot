@@ -10,6 +10,7 @@ from discord.ui import View
 from discord.utils import MISSING
 
 from core.audio import create_audio_service
+from core.audio.startup_timer import PlayStartupTimer
 from core.util import log_event
 from core.local.music import MusicDataSource
 from core.local.music.model import MusicModel
@@ -33,6 +34,7 @@ class Music(commands.Cog):
         self.guild_channel: Dict[int, MusicModel] = {}
         # Key: guild_id, Value: {"lock": asyncio.Lock, "pending": int}
         self.guild_action_state: Dict[int, Dict[str, object]] = {}
+        self._background_tasks: set[asyncio.Task] = set()
         self.audio_service = create_audio_service(bot)
         self.audio_service.on_track_start = self._on_track_start
         self.audio_service.on_queue_empty = self._on_queue_empty
@@ -42,6 +44,12 @@ class Music(commands.Cog):
         # cog 언로드/리로드(-reload) 시 호출되는 discord.py 라이프사이클 훅.
         # 이 인스턴스가 등록한 백그라운드 작업(노드 정기 재탐색 루프, 트랙 모니터)을 취소해
         # 새 인스턴스와 중복 실행/누수되지 않게 한다.
+        tasks = list(self._background_tasks)
+        self._background_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         try:
             await self.audio_service.close()
         except Exception as exc:
@@ -186,12 +194,23 @@ class Music(commands.Cog):
                 channel_name=author,
             )
 
-        tracks_app = [MusicApplication(
-            youtube_search=to_youtube_search(t),
-            user_id=requester.id,
-            user_name=requester.name,
-            user_icon=requester.display_avatar.url,
-        ) for t in tracks]
+        backend = self.audio_service.backend
+        get_node_identifier = getattr(backend, "track_node_identifier", None)
+        tracks_app = [
+            MusicApplication(
+                youtube_search=to_youtube_search(t),
+                user_id=requester.id,
+                user_name=requester.name,
+                user_icon=requester.display_avatar.url,
+                lavalink_track=t,
+                lavalink_node_identifier=(
+                    get_node_identifier(t)
+                    if callable(get_node_identifier)
+                    else getattr(t, "_music_bot_node_identifier", None)
+                ),
+            )
+            for t in tracks
+        ]
 
         return tracks_app, playlist_title, playlist_count
 
@@ -345,6 +364,76 @@ class Music(commands.Cog):
             message.guild.id,
             message.author.voice.channel,
         )
+
+    @staticmethod
+    def _consume_background_task(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log_event(f"music background task failed: {exc}")
+
+    def _schedule_background(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        tasks = getattr(self, "_background_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._background_tasks = tasks
+        tasks.add(task)
+
+        def done(completed: asyncio.Task) -> None:
+            tasks.discard(completed)
+            self._consume_background_task(completed)
+
+        task.add_done_callback(done)
+        return task
+
+    async def _prepare_voice_and_tracks(
+        self,
+        message,
+        timer: PlayStartupTimer,
+    ):
+        async def prepare_voice():
+            timer.mark("voice_task_start")
+            result = await self.ensure_voice_model(message)
+            timer.mark("voice_task_done")
+            return result
+
+        async def search_tracks():
+            timer.mark("search_task_start", query_length=len(message.content))
+            result = await self._search_tracks(message.content, message.author, limit=1)
+            timer.mark("search_task_done")
+            return result
+
+        voice_task = asyncio.create_task(prepare_voice())
+        search_task = asyncio.create_task(search_tracks())
+        try:
+            voice_state, search_result = await asyncio.gather(voice_task, search_task)
+        except BaseException:
+            for task in (voice_task, search_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(voice_task, search_task, return_exceptions=True)
+            raise
+        return voice_state, search_result
+
+    async def _send_music_request_result(
+        self,
+        message,
+        tracks,
+        playlist_title,
+        playlist_count,
+    ) -> None:
+        if playlist_title:
+            count_text = playlist_count if playlist_count is not None else len(tracks)
+            content = (
+                f"{playlist_title} 플레이 리스트를 추가했어요!\n"
+                f"추가된 곡 수: {count_text}"
+            )
+        else:
+            content = f"{tracks[0].youtube_search.title} 곡을 추가했어요!"
+        await message.channel.send(content, delete_after=5)
 
     async def get_channel_message(self, guild_id: int) -> Optional[discord.Message]:
         music_model = self.guild_channel.get(guild_id, None)
@@ -649,44 +738,46 @@ class Music(commands.Cog):
         if existing_state is not None and message.author.voice.channel.id != existing_state.voice_channel_id:
             return
 
-        await self.ensure_voice_model(message)
-
         async def delete_message():
             try:
                 await message.delete(delay=5)
-            except:
+            except Exception:
                 pass
 
-        await delete_message()
+        timer = PlayStartupTimer(message.guild.id)
+        timer.mark("message_received", query_length=len(message.content))
+        self._schedule_background(delete_message())
+        timer.mark("message_delete_scheduled")
 
         async def send_and_delete_message(content: str):
             await message.channel.send(content, delete_after=5)
 
         try:
-            tracks, playlist_title, playlist_count = await self._search_tracks(message.content, message.author, limit=1)
+            _, search_result = await self._prepare_voice_and_tracks(message, timer)
+            tracks, playlist_title, playlist_count = search_result
         except SourceNotAllowed as exc:
             # 현재 모드에서 허용되지 않는 소스(예: youtube 모드에서 Spotify URL) → 안내 후 자동삭제.
-            await send_and_delete_message(str(exc))
+            self._schedule_background(send_and_delete_message(str(exc)))
             return
 
         if not tracks:
-            await send_and_delete_message("노래를 찾지 못했어요..")
+            self._schedule_background(send_and_delete_message("노래를 찾지 못했어요.."))
             return
 
+        for track in tracks:
+            track.startup_timer = timer
+        timer.mark("enqueue_start")
         await self.audio_service.enqueue_and_play(message.guild.id, message.author.voice.channel, tracks)
 
-        if playlist_title:
-            count_text = playlist_count if playlist_count is not None else len(tracks)
-            await send_and_delete_message(f"{playlist_title} 플레이 리스트를 추가했어요!\n추가된 곡 수: {count_text}")
-        else:
-            await send_and_delete_message(f"{tracks[0].youtube_search.title} 곡을 추가했어요!")
-
-        status = await self.audio_service.get_status(message.guild.id)
-        if status:
-            await self.refresh_now_playing_embed(
-                message.guild.id,
-                is_paused=status.is_paused
+        self._schedule_background(
+            self._send_music_request_result(
+                message,
+                tracks,
+                playlist_title,
+                playlist_count,
             )
+        )
+        timer.mark("user_message_scheduled")
 
 
 
