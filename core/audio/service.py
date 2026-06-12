@@ -15,6 +15,7 @@ from core.config import AUDIO_BACKEND
 
 
 OnGuildEvent = Callable[[int], Awaitable[None]]
+MAX_TRACK_PLAYBACK_RETRIES = 1
 
 
 class AudioService:
@@ -25,14 +26,17 @@ class AudioService:
         *,
         on_track_start: Optional[OnGuildEvent] = None,
         on_queue_empty: Optional[OnGuildEvent] = None,
+        on_queue_changed: Optional[OnGuildEvent] = None,
     ) -> None:
         self.backend = backend
         self.loop = loop
         self.states: Dict[int, AudioState] = {}
         self._locks: Dict[int, asyncio.Lock] = {}
         self._play_start_times: Dict[int, float] = {}
+        self._track_failure_counts: Dict[tuple[int, int], int] = {}
         self.on_track_start = on_track_start
         self.on_queue_empty = on_queue_empty
+        self.on_queue_changed = on_queue_changed
 
     async def connect(self, bot: discord.Client) -> None:
         await self.backend.connect(bot)
@@ -100,17 +104,26 @@ class AudioService:
         voice_channel: discord.VoiceChannel,
         tracks: Iterable[MusicApplication],
     ) -> None:
+        queued_tracks = list(tracks)
         async with self._get_lock(guild_id):
             state = await self.ensure_state(guild_id, voice_channel)
-            state.queue.extend(tracks)
+            state.queue.extend(queued_tracks)
             should_start = state.now_playing is None
             if should_start:
                 self._play_start_times[guild_id] = time.monotonic()
 
         if should_start:
             await self.play_next(guild_id)
+        elif queued_tracks and self.on_queue_changed:
+            callback_task = asyncio.create_task(self.on_queue_changed(guild_id))
+            callback_task.add_done_callback(self._consume_callback_task)
 
-    async def play_next(self, guild_id: int, previous: Optional[MusicApplication] = None) -> None:
+    async def play_next(
+        self,
+        guild_id: int,
+        previous: Optional[MusicApplication] = None,
+        playback_error: Optional[Exception] = None,
+    ) -> None:
         while True:
             queue_empty_callback = None
             next_track = None
@@ -119,8 +132,33 @@ class AudioService:
                 if state is None:
                     return
 
-                if state.loop and previous is not None:
+                if previous is not None and playback_error is not None:
+                    state.now_playing = None
+                    state.is_paused = False
+                    failure_key = (guild_id, id(previous))
+                    failure_count = self._track_failure_counts.get(failure_key, 0) + 1
+                    self._track_failure_counts[failure_key] = failure_count
+                    if failure_count <= MAX_TRACK_PLAYBACK_RETRIES:
+                        previous.lavalink_track = None
+                        previous.lavalink_node_identifier = None
+                        state.queue.insert(0, previous)
+                        log_event(
+                            "playback retry scheduled "
+                            f"guild_id={guild_id} attempt={failure_count} error={playback_error}"
+                        )
+                    else:
+                        self._track_failure_counts.pop(failure_key, None)
+                        log_event(
+                            "playback retry exhausted "
+                            f"guild_id={guild_id} attempts={failure_count} error={playback_error}"
+                        )
+                    previous = None
+                    playback_error = None
+                elif state.loop and previous is not None:
                     state.queue.append(previous)
+                    self._track_failure_counts.pop((guild_id, id(previous)), None)
+                elif previous is not None:
+                    self._track_failure_counts.pop((guild_id, id(previous)), None)
 
                 if not state.queue:
                     state.now_playing = None
@@ -179,8 +217,11 @@ class AudioService:
                 continue
 
     def _on_track_end(self, guild_id: int, previous: MusicApplication):
-        def _callback(_: Optional[Exception] = None) -> None:
-            asyncio.run_coroutine_threadsafe(self.play_next(guild_id, previous), self.loop)
+        def _callback(error: Optional[Exception] = None) -> None:
+            asyncio.run_coroutine_threadsafe(
+                self.play_next(guild_id, previous, error),
+                self.loop,
+            )
 
         return _callback
 
@@ -209,6 +250,8 @@ class AudioService:
             state.now_playing = None
             state.is_paused = False
             self._play_start_times.pop(guild_id, None)
+            for key in [key for key in self._track_failure_counts if key[0] == guild_id]:
+                self._track_failure_counts.pop(key, None)
         await self.backend.stop(guild_id)
 
     async def skip(self, guild_id: int) -> None:
@@ -218,6 +261,8 @@ class AudioService:
         async with self._get_lock(guild_id):
             self.states.pop(guild_id, None)
             self._play_start_times.pop(guild_id, None)
+            for key in [key for key in self._track_failure_counts if key[0] == guild_id]:
+                self._track_failure_counts.pop(key, None)
         await self.backend.disconnect(guild_id)
 
     async def toggle_loop(self, guild_id: int) -> bool:

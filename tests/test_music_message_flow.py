@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+import cogs.music as music_module
 from cogs.music import Music, SourceNotAllowed
 from core.audio.service import AudioService
 from core.audio.startup_timer import PlayStartupTimer
@@ -314,3 +316,120 @@ async def test_now_playing_refresh_callback_does_not_block_playback_start():
     assert not callback_finished.is_set()
 
     await asyncio.wait_for(callback_finished.wait(), timeout=0.3)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_while_playing_schedules_queue_view_refresh():
+    queue_changed = asyncio.Event()
+
+    class FakeBackend:
+        async def ensure_player(self, *_args):
+            return None
+
+        async def is_playing(self, _guild_id):
+            return False
+
+        async def play(self, _guild_id, _track, _on_end):
+            return None
+
+    async def on_queue_changed(_guild_id):
+        queue_changed.set()
+
+    service = AudioService(
+        FakeBackend(),
+        asyncio.get_running_loop(),
+        on_queue_changed=on_queue_changed,
+    )
+    voice_channel = SimpleNamespace(id=9)
+    first = application_track()
+    second = application_track()
+    second.youtube_search.title = "Second"
+
+    await service.enqueue_and_play(1, voice_channel, [first])
+    await service.enqueue_and_play(1, voice_channel, [second])
+    await asyncio.wait_for(queue_changed.wait(), timeout=0.1)
+
+    status = await service.get_status(1)
+    assert status is not None
+    assert status.now_playing is first
+    assert status.queue == [second]
+
+
+@pytest.mark.asyncio
+async def test_refresh_now_playing_embed_includes_queue_titles(monkeypatch):
+    now_playing = application_track()
+    queued = application_track()
+    queued.youtube_search.title = "Queued song"
+    captured = {}
+
+    def fake_build_now_playing_view(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        music_module,
+        "build_now_playing_view",
+        fake_build_now_playing_view,
+    )
+    music = make_music()
+    music.audio_service = SimpleNamespace(
+        get_status=AsyncMock(
+            return_value=SimpleNamespace(
+                now_playing=now_playing,
+                queue=[queued],
+                loop=False,
+                is_paused=False,
+            )
+        )
+    )
+    music.music_message_edit = AsyncMock()
+
+    await music.refresh_now_playing_embed(1)
+
+    assert captured["queue_preview"] == "1. Queued song"
+    music.music_message_edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_track_retries_once_with_direct_load_then_advances_queue():
+    class FakeBackend:
+        def __init__(self):
+            self.play_calls = []
+            self.callbacks = []
+
+        async def ensure_player(self, *_args):
+            return None
+
+        async def is_playing(self, _guild_id):
+            return False
+
+        async def play(self, _guild_id, track, on_end):
+            self.play_calls.append(track)
+            self.callbacks.append(on_end)
+
+        async def stop(self, _guild_id):
+            return None
+
+    backend = FakeBackend()
+    service = AudioService(backend, asyncio.get_running_loop())
+    voice_channel = SimpleNamespace(id=9)
+    first = application_track()
+    second = application_track()
+    second.youtube_search.title = "Second"
+    second.lavalink_track = object()
+    second.lavalink_node_identifier = "node-a"
+    third = application_track()
+    third.youtube_search.title = "Third"
+
+    await service.enqueue_and_play(1, voice_channel, [first, second, third])
+    await service.play_next(1, first)
+    assert backend.play_calls[-1] is second
+
+    await service.play_next(1, second, RuntimeError("stream timeout"))
+    assert backend.play_calls[-1] is second
+    assert second.lavalink_track is None
+    assert second.lavalink_node_identifier is None
+
+    await service.play_next(1, second, RuntimeError("stream timeout again"))
+    assert backend.play_calls[-1] is third
+    assert backend.play_calls == [first, second, second, third]

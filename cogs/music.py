@@ -38,6 +38,7 @@ class Music(commands.Cog):
         self.audio_service = create_audio_service(bot)
         self.audio_service.on_track_start = self._on_track_start
         self.audio_service.on_queue_empty = self._on_queue_empty
+        self.audio_service.on_queue_changed = self._on_queue_changed
         asyncio.run_coroutine_threadsafe(self.load_local_guild_channel(), self.bot.loop)
 
     async def cog_unload(self):
@@ -276,6 +277,14 @@ class Music(commands.Cog):
 
     async def _on_track_start(self, guild_id: int) -> None:
         await self.refresh_now_playing_embed(guild_id=guild_id, is_paused=False)
+
+    async def _on_queue_changed(self, guild_id: int) -> None:
+        status = await self.audio_service.get_status(guild_id)
+        if status is not None and status.now_playing is not None:
+            await self.refresh_now_playing_embed(
+                guild_id=guild_id,
+                is_paused=status.is_paused,
+            )
 
     async def _on_queue_empty(self, guild_id: int) -> None:
         await self.music_message_edit(guild_id=guild_id, view=build_idle_view())

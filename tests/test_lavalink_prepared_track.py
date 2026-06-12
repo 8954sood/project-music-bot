@@ -36,6 +36,7 @@ class FakePlayer:
         fail_direct_load: bool = False,
     ) -> None:
         self.node = node
+        self.guild = SimpleNamespace(id=1)
         self.is_connected = True
         self.fail_prepared = fail_prepared
         self.fail_direct_load = fail_direct_load
@@ -94,8 +95,8 @@ def make_backend(player):
     backend._players = {1: player}
     backend._pool = FakePool(node_info)
     backend._pomice = SimpleNamespace(NodePool=FakeNodePool)
-    backend._monitor_tasks = {}
-    backend._start_monitor = lambda *args: None
+    backend._end_callbacks = {}
+    backend._track_errors = {}
     return backend
 
 
@@ -167,3 +168,63 @@ async def test_failed_prepared_and_direct_load_propagates_to_failover_pool():
         await backend.play(1, make_track(object(), "node-a"), lambda _: None)
 
     assert player.get_tracks_call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_track_exception_is_delivered_with_load_failed_end():
+    target = SimpleNamespace(_identifier="node-a")
+    FakeNodePool.target = target
+    player = FakePlayer(target)
+    backend = make_backend(player)
+    received = []
+
+    await backend.play(1, make_track(object(), "node-a"), received.append)
+    await backend._on_pomice_track_exception(player, None, "stream timeout")
+    await backend._on_pomice_track_end(player, None, "loadFailed")
+
+    assert len(received) == 1
+    assert isinstance(received[0], RuntimeError)
+    assert "stream timeout" in str(received[0])
+
+
+@pytest.mark.asyncio
+async def test_replaced_event_does_not_advance_queue():
+    target = SimpleNamespace(_identifier="node-a")
+    FakeNodePool.target = target
+    player = FakePlayer(target)
+    backend = make_backend(player)
+    received = []
+
+    await backend.play(1, make_track(object(), "node-a"), received.append)
+    await backend._on_pomice_track_end(player, None, "replaced")
+
+    assert received == []
+    assert 1 in backend._end_callbacks
+
+
+def test_event_listeners_are_registered_and_removed_once():
+    calls = []
+
+    class FakeBot:
+        def add_listener(self, listener, name):
+            calls.append(("add", name, listener))
+
+        def remove_listener(self, listener, name):
+            calls.append(("remove", name, listener))
+
+    backend = LavalinkNodeBackend.__new__(LavalinkNodeBackend)
+    backend._bot = FakeBot()
+    backend._listeners_registered = False
+
+    backend._register_event_listeners()
+    backend._register_event_listeners()
+    backend._remove_event_listeners()
+
+    assert [call[:2] for call in calls] == [
+        ("add", "on_pomice_track_exception"),
+        ("add", "on_pomice_track_stuck"),
+        ("add", "on_pomice_track_end"),
+        ("remove", "on_pomice_track_exception"),
+        ("remove", "on_pomice_track_stuck"),
+        ("remove", "on_pomice_track_end"),
+    ]
