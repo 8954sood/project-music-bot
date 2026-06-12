@@ -21,6 +21,7 @@ pomice 사용 주의
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Dict, Optional, Set
 
 import discord
@@ -33,7 +34,13 @@ from core.config import (
     LAVALINK_NODE_SOURCE,
 )
 from core.model.music_application import MusicApplication
-from core.util import log_event
+from core.util import log_event, log_exception
+
+
+@dataclass(frozen=True)
+class LavalinkTrackResults:
+    payload: object
+    node_identifier: str
 
 
 class LavalinkNodeBackend(AudioBackend):
@@ -47,7 +54,9 @@ class LavalinkNodeBackend(AudioBackend):
         self._pool = LavalinkNodePool()
         self._bot: Optional[discord.Client] = None
         self._players: Dict[int, "pomice.Player"] = {}
-        self._monitor_tasks: Dict[int, asyncio.Task] = {}
+        self._end_callbacks: Dict[int, OnTrackEnd] = {}
+        self._track_errors: Dict[int, Exception] = {}
+        self._listeners_registered = False
         self._created: Set[str] = set()  # create_node 성공한 노드 identifier
         self._register_lock = asyncio.Lock()  # discover/등록 동시 실행 직렬화
         self._refresh_task: Optional[asyncio.Task] = None  # 주기적 노드 재탐색 루프
@@ -57,6 +66,7 @@ class LavalinkNodeBackend(AudioBackend):
     # ------------------------------------------------------------------ #
     async def connect(self, bot: discord.Client) -> None:
         self._bot = bot
+        self._register_event_listeners()
         async with self._register_lock:
             await self._register_pool_nodes()
         # 공개 노드는 수시로 죽고 살아나므로 주기적으로(기본 24h) 재탐색한다. 시작 시 1회만 띄움.
@@ -64,19 +74,107 @@ class LavalinkNodeBackend(AudioBackend):
             self._refresh_task = asyncio.create_task(self._periodic_refresh_loop())
 
     async def close(self) -> None:
-        """등록한 백그라운드 작업(정기 재탐색 루프 + 트랙 종료 모니터들)을 취소한다.
+        """정기 재탐색 task와 pomice track event listener를 정리한다.
 
-        cog 언로드/리로드(Music.cog_unload) 시 호출되어, 이전 인스턴스의 작업이 새 인스턴스와
-        함께 중복 실행되며 누수되는 것을 막는다. 음성 연결(player) 자체는 건드리지 않는다.
+        cog 언로드/리로드 시 이전 backend의 listener가 새 인스턴스와 중복 실행되는 것을 막는다.
+        음성 연결(player) 자체는 건드리지 않는다.
         """
         task = self._refresh_task
         self._refresh_task = None
         if task is not None:
             task.cancel()
 
-        for monitor in list(self._monitor_tasks.values()):
-            monitor.cancel()
-        self._monitor_tasks.clear()
+        self._remove_event_listeners()
+        self._end_callbacks.clear()
+        self._track_errors.clear()
+
+    def _register_event_listeners(self) -> None:
+        if self._bot is None or self._listeners_registered:
+            return
+        add_listener = getattr(self._bot, "add_listener", None)
+        if not callable(add_listener):
+            return
+        add_listener(self._on_pomice_track_exception, "on_pomice_track_exception")
+        add_listener(self._on_pomice_track_stuck, "on_pomice_track_stuck")
+        add_listener(self._on_pomice_track_end, "on_pomice_track_end")
+        self._listeners_registered = True
+
+    def _remove_event_listeners(self) -> None:
+        if self._bot is None or not self._listeners_registered:
+            return
+        remove_listener = getattr(self._bot, "remove_listener", None)
+        if callable(remove_listener):
+            remove_listener(self._on_pomice_track_exception, "on_pomice_track_exception")
+            remove_listener(self._on_pomice_track_stuck, "on_pomice_track_stuck")
+            remove_listener(self._on_pomice_track_end, "on_pomice_track_end")
+        self._listeners_registered = False
+
+    def _event_guild_id(self, player) -> Optional[int]:
+        guild = getattr(player, "guild", None)
+        guild_id = getattr(guild, "id", None)
+        if guild_id is None or self._players.get(guild_id) is not player:
+            return None
+        return guild_id
+
+    async def _on_pomice_track_exception(self, player, _track, error) -> None:
+        guild_id = self._event_guild_id(player)
+        if guild_id is None:
+            return
+        self._track_errors[guild_id] = RuntimeError(f"Lavalink track exception: {error}")
+        node_id = getattr(getattr(player, "node", None), "_identifier", "unknown")
+        track_id = getattr(_track, "identifier", None) or getattr(_track, "track_id", "unknown")
+        log_event(
+            "lavalink-node track exception "
+            f"guild_id={guild_id} node={node_id} track_id={track_id} error={error}"
+        )
+
+    async def _on_pomice_track_stuck(self, player, _track, threshold) -> None:
+        guild_id = self._event_guild_id(player)
+        if guild_id is None:
+            return
+        self._track_errors[guild_id] = RuntimeError(
+            f"Lavalink track stuck after {threshold}ms"
+        )
+        node_id = getattr(getattr(player, "node", None), "_identifier", "unknown")
+        track_id = getattr(_track, "identifier", None) or getattr(_track, "track_id", "unknown")
+        log_event(
+            "lavalink-node track stuck "
+            f"guild_id={guild_id} node={node_id} track_id={track_id} "
+            f"threshold_ms={threshold}"
+        )
+
+    async def _on_pomice_track_end(self, player, _track, reason) -> None:
+        guild_id = self._event_guild_id(player)
+        if guild_id is None:
+            return
+        normalized_reason = str(reason).lower()
+        if normalized_reason == "replaced":
+            self._track_errors.pop(guild_id, None)
+            node_id = getattr(getattr(player, "node", None), "_identifier", "unknown")
+            track_id = getattr(_track, "identifier", None) or getattr(
+                _track, "track_id", "unknown"
+            )
+            log_event(
+                "lavalink-node track end "
+                f"guild_id={guild_id} node={node_id} track_id={track_id} "
+                f"reason={reason} ignored=true"
+            )
+            return
+
+        error = self._track_errors.pop(guild_id, None)
+        if error is None and normalized_reason in {"loadfailed", "load_failed", "cleanup"}:
+            error = RuntimeError(f"Lavalink track ended with reason={reason}")
+
+        callback = self._end_callbacks.pop(guild_id, None)
+        node_id = getattr(getattr(player, "node", None), "_identifier", "unknown")
+        track_id = getattr(_track, "identifier", None) or getattr(_track, "track_id", "unknown")
+        log_event(
+            "lavalink-node track end "
+            f"guild_id={guild_id} node={node_id} track_id={track_id} reason={reason} "
+            f"has_error={error is not None} callback_registered={callback is not None}"
+        )
+        if callback is not None:
+            callback(error)
 
     def _in_use(self) -> bool:
         """어느 길드든 음성에 연결된 player 가 있으면 '사용 중'으로 본다(재탐색은 player 를 파괴하므로)."""
@@ -106,7 +204,7 @@ class LavalinkNodeBackend(AudioBackend):
                 healthy = await self.refresh_nodes()
                 log_event(f"lavalink-node: periodic refresh done, {len(healthy)} healthy nodes")
             except Exception as exc:
-                log_event(f"lavalink-node: periodic refresh failed: {exc}")
+                log_exception("lavalink-node periodic refresh failed", exc)
 
     def _available_nodes(self):
         return [n for n in self._pomice.NodePool._nodes.values() if getattr(n, "_available", False)]
@@ -184,7 +282,7 @@ class LavalinkNodeBackend(AudioBackend):
             )
         except Exception as exc:
             # /version 실패/타임아웃/연결 실패 노드는 수용하지 않는다(스킵).
-            log_event(f"create_node failed (skipped) node={node.label}: {exc}")
+            log_exception(f"create_node failed node={node.label}", exc)
             self._pomice.NodePool._nodes.pop(node.identifier, None)  # 타임아웃 시 잔여분 정리
             return None
 
@@ -288,13 +386,16 @@ class LavalinkNodeBackend(AudioBackend):
         try:
             player = await voice_channel.connect(cls=self._pomice.Player)
         except Exception as exc:
-            log_event(f"ensure_player connect failed guild={guild_id} channel={voice_channel.id}: {exc}")
+            log_exception(
+                f"ensure_player connect failed guild_id={guild_id} channel_id={voice_channel.id}",
+                exc,
+            )
             raise
         log_event(f"ensure_player connected guild={guild_id} channel={voice_channel.id} node={getattr(player.node, '_identifier', None)}")
         self._players[guild_id] = player
 
     async def get_tracks(self, query: str):
-        """검색용 loadtracks. sticky 노드부터 failover 로 시도하고 pomice 원시 결과를 반환한다.
+        """검색용 loadtracks 결과와 성공 노드 identifier를 함께 반환한다.
 
         - 결과 없음(loadType empty)은 노드 실패가 아니라 정상 응답이므로 그대로(None/빈 결과) 반환한다.
           (그렇지 않으면 매칭 없는 검색어 하나가 멀쩡한 노드를 전부 제거해버린다.)
@@ -303,9 +404,20 @@ class LavalinkNodeBackend(AudioBackend):
         """
         async def action(node: NodeInfo):
             target = self._pomice.NodePool.get_node(identifier=node.identifier)
-            return await target.get_tracks(query=query)
+            results = await target.get_tracks(query=query)
+            return LavalinkTrackResults(results, node.identifier)
 
         return await self._pool.run_with_failover(action)
+
+    @staticmethod
+    def _result_tracks(results):
+        if results is None:
+            return []
+        if isinstance(results, list):
+            return results
+        if hasattr(results, "tracks"):
+            return list(results.tracks)
+        return [results]
 
     async def play(self, guild_id: int, track: MusicApplication, on_end: OnTrackEnd) -> None:
         player = self._players.get(guild_id)
@@ -317,45 +429,94 @@ class LavalinkNodeBackend(AudioBackend):
             if player.node is None or player.node._identifier != node.identifier:
                 await self._swap_to(player, target)
 
-            results = await player.get_tracks(query=track.youtube_search.video_url)
-            if results is None:
-                raise RuntimeError("노드가 트랙을 찾지 못함")
-            if isinstance(results, list):
-                tracks = results
-            elif hasattr(results, "tracks"):
-                tracks = list(results.tracks)
-            else:
-                tracks = []
-            if not tracks:
-                raise RuntimeError("노드가 트랙을 찾지 못함")
+            timer = track.startup_timer
+            prepared = track.lavalink_track
+            prepared_node = track.lavalink_node_identifier
+            same_node = prepared_node is None or prepared_node == node.identifier
+            fallback_reason = None
 
-            await player.play(track=tracks[0])
-            self._start_monitor(guild_id, player, on_end)
+            if prepared is not None and same_node:
+                self._end_callbacks[guild_id] = on_end
+                self._track_errors.pop(guild_id, None)
+                try:
+                    if timer:
+                        timer.mark("backend_play_start", node=node.identifier)
+                        timer.mark("prepared_track_used", node=node.identifier)
+                    log_event(
+                        "lavalink-node play using prepared track "
+                        f"guild={guild_id} node={node.label} title={track.youtube_search.title}"
+                    )
+                    await player.play(track=prepared)
+                except Exception as exc:
+                    if self._end_callbacks.get(guild_id) is on_end:
+                        self._end_callbacks.pop(guild_id, None)
+                        self._track_errors.pop(guild_id, None)
+                    fallback_reason = "prepared_track_failed"
+                    log_exception(
+                        "lavalink-node play fallback direct load "
+                        f"guild={guild_id} node={node.label} "
+                        f"track_id={track.youtube_search.video_id or 'unknown'} "
+                        f"reason={fallback_reason}",
+                        exc,
+                    )
+            else:
+                fallback_reason = (
+                    "missing_prepared_track" if prepared is None else "prepared_track_node_mismatch"
+                )
+                if timer:
+                    timer.mark("backend_play_start", node=node.identifier)
+                log_event(
+                    "lavalink-node play fallback direct load "
+                    f"guild={guild_id} node={node.label} reason={fallback_reason}"
+                )
+
+            if fallback_reason is not None:
+                if timer:
+                    timer.mark("direct_load_fallback_start", reason=fallback_reason)
+                try:
+                    results = await player.get_tracks(query=track.youtube_search.video_url)
+                except Exception as exc:
+                    if self._end_callbacks.get(guild_id) is on_end:
+                        self._end_callbacks.pop(guild_id, None)
+                        self._track_errors.pop(guild_id, None)
+                    log_exception(
+                        "lavalink-node direct load failed "
+                        f"guild_id={guild_id} node={node.label} "
+                        f"track_id={track.youtube_search.video_id or 'unknown'} "
+                        f"reason={fallback_reason}",
+                        exc,
+                    )
+                    raise
+                tracks = self._result_tracks(results)
+                if not tracks:
+                    raise RuntimeError("노드가 트랙을 찾지 못함")
+                if timer:
+                    timer.mark("direct_load_fallback_done", reason=fallback_reason)
+                self._end_callbacks[guild_id] = on_end
+                self._track_errors.pop(guild_id, None)
+                try:
+                    await player.play(track=tracks[0])
+                except Exception as exc:
+                    if self._end_callbacks.get(guild_id) is on_end:
+                        self._end_callbacks.pop(guild_id, None)
+                        self._track_errors.pop(guild_id, None)
+                    log_exception(
+                        "lavalink-node player play failed "
+                        f"guild_id={guild_id} node={node.label} "
+                        f"track_id={track.youtube_search.video_id or 'unknown'} "
+                        f"mode=direct_load",
+                        exc,
+                    )
+                    raise
+
+            if timer:
+                timer.mark("backend_play_done", node=node.identifier)
             log_event(
                 f"lavalink-node play guild={guild_id} node={node.label} title={track.youtube_search.title}"
             )
             return node
 
         await self._pool.run_with_failover(action)
-
-    def _start_monitor(self, guild_id: int, player, on_end: OnTrackEnd) -> None:
-        task = self._monitor_tasks.pop(guild_id, None)
-        if task is not None:
-            task.cancel()
-
-        async def _monitor() -> None:
-            # 트랙 종료를 폴링으로 감지 (기존 lavalink_backend 와 동일 방식, cog 리스너 불필요).
-            while True:
-                await asyncio.sleep(1)
-                if getattr(player, "is_dead", False):
-                    break
-                is_playing = player.is_playing() if callable(player.is_playing) else player.is_playing
-                is_paused = player.is_paused() if callable(player.is_paused) else player.is_paused
-                if not is_playing and not is_paused and player.current is None:
-                    break
-            on_end(None)
-
-        self._monitor_tasks[guild_id] = asyncio.create_task(_monitor())
 
     # 제어 동작은 best-effort: 노드 오류(예: 404 Session not found, 죽은 노드)로 인해
     # 호출부(특히 on_voice_state_update 정리 핸들러)가 죽지 않도록 예외를 흡수한다.
@@ -408,9 +569,8 @@ class LavalinkNodeBackend(AudioBackend):
             return False
 
     async def disconnect(self, guild_id: int) -> None:
-        task = self._monitor_tasks.pop(guild_id, None)
-        if task is not None:
-            task.cancel()
+        self._end_callbacks.pop(guild_id, None)
+        self._track_errors.pop(guild_id, None)
 
         player = self._players.pop(guild_id, None)
         if player is None:
@@ -426,9 +586,8 @@ class LavalinkNodeBackend(AudioBackend):
     async def refresh_nodes(self):
         """노드 풀 재탐색 + pomice 노드 재등록. 재생 가능 노드(NodeInfo) 목록 반환."""
         async with self._register_lock:
-            for task in list(self._monitor_tasks.values()):
-                task.cancel()
-            self._monitor_tasks.clear()
+            self._end_callbacks.clear()
+            self._track_errors.clear()
             for guild_id, player in list(self._players.items()):
                 try:
                     await player.destroy()
