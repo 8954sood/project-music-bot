@@ -34,7 +34,7 @@ from core.config import (
     LAVALINK_NODE_SOURCE,
 )
 from core.model.music_application import MusicApplication
-from core.util import log_event
+from core.util import log_event, log_exception
 
 
 @dataclass(frozen=True)
@@ -121,7 +121,12 @@ class LavalinkNodeBackend(AudioBackend):
         if guild_id is None:
             return
         self._track_errors[guild_id] = RuntimeError(f"Lavalink track exception: {error}")
-        log_event(f"lavalink-node track exception guild={guild_id}: {error}")
+        node_id = getattr(getattr(player, "node", None), "_identifier", "unknown")
+        track_id = getattr(_track, "identifier", None) or getattr(_track, "track_id", "unknown")
+        log_event(
+            "lavalink-node track exception "
+            f"guild_id={guild_id} node={node_id} track_id={track_id} error={error}"
+        )
 
     async def _on_pomice_track_stuck(self, player, _track, threshold) -> None:
         guild_id = self._event_guild_id(player)
@@ -130,7 +135,13 @@ class LavalinkNodeBackend(AudioBackend):
         self._track_errors[guild_id] = RuntimeError(
             f"Lavalink track stuck after {threshold}ms"
         )
-        log_event(f"lavalink-node track stuck guild={guild_id} threshold_ms={threshold}")
+        node_id = getattr(getattr(player, "node", None), "_identifier", "unknown")
+        track_id = getattr(_track, "identifier", None) or getattr(_track, "track_id", "unknown")
+        log_event(
+            "lavalink-node track stuck "
+            f"guild_id={guild_id} node={node_id} track_id={track_id} "
+            f"threshold_ms={threshold}"
+        )
 
     async def _on_pomice_track_end(self, player, _track, reason) -> None:
         guild_id = self._event_guild_id(player)
@@ -139,6 +150,15 @@ class LavalinkNodeBackend(AudioBackend):
         normalized_reason = str(reason).lower()
         if normalized_reason == "replaced":
             self._track_errors.pop(guild_id, None)
+            node_id = getattr(getattr(player, "node", None), "_identifier", "unknown")
+            track_id = getattr(_track, "identifier", None) or getattr(
+                _track, "track_id", "unknown"
+            )
+            log_event(
+                "lavalink-node track end "
+                f"guild_id={guild_id} node={node_id} track_id={track_id} "
+                f"reason={reason} ignored=true"
+            )
             return
 
         error = self._track_errors.pop(guild_id, None)
@@ -146,6 +166,13 @@ class LavalinkNodeBackend(AudioBackend):
             error = RuntimeError(f"Lavalink track ended with reason={reason}")
 
         callback = self._end_callbacks.pop(guild_id, None)
+        node_id = getattr(getattr(player, "node", None), "_identifier", "unknown")
+        track_id = getattr(_track, "identifier", None) or getattr(_track, "track_id", "unknown")
+        log_event(
+            "lavalink-node track end "
+            f"guild_id={guild_id} node={node_id} track_id={track_id} reason={reason} "
+            f"has_error={error is not None} callback_registered={callback is not None}"
+        )
         if callback is not None:
             callback(error)
 
@@ -177,7 +204,7 @@ class LavalinkNodeBackend(AudioBackend):
                 healthy = await self.refresh_nodes()
                 log_event(f"lavalink-node: periodic refresh done, {len(healthy)} healthy nodes")
             except Exception as exc:
-                log_event(f"lavalink-node: periodic refresh failed: {exc}")
+                log_exception("lavalink-node periodic refresh failed", exc)
 
     def _available_nodes(self):
         return [n for n in self._pomice.NodePool._nodes.values() if getattr(n, "_available", False)]
@@ -255,7 +282,7 @@ class LavalinkNodeBackend(AudioBackend):
             )
         except Exception as exc:
             # /version 실패/타임아웃/연결 실패 노드는 수용하지 않는다(스킵).
-            log_event(f"create_node failed (skipped) node={node.label}: {exc}")
+            log_exception(f"create_node failed node={node.label}", exc)
             self._pomice.NodePool._nodes.pop(node.identifier, None)  # 타임아웃 시 잔여분 정리
             return None
 
@@ -359,7 +386,10 @@ class LavalinkNodeBackend(AudioBackend):
         try:
             player = await voice_channel.connect(cls=self._pomice.Player)
         except Exception as exc:
-            log_event(f"ensure_player connect failed guild={guild_id} channel={voice_channel.id}: {exc}")
+            log_exception(
+                f"ensure_player connect failed guild_id={guild_id} channel_id={voice_channel.id}",
+                exc,
+            )
             raise
         log_event(f"ensure_player connected guild={guild_id} channel={voice_channel.id} node={getattr(player.node, '_identifier', None)}")
         self._players[guild_id] = player
@@ -422,10 +452,12 @@ class LavalinkNodeBackend(AudioBackend):
                         self._end_callbacks.pop(guild_id, None)
                         self._track_errors.pop(guild_id, None)
                     fallback_reason = "prepared_track_failed"
-                    log_event(
+                    log_exception(
                         "lavalink-node play fallback direct load "
                         f"guild={guild_id} node={node.label} "
-                        f"reason={fallback_reason} error={type(exc).__name__}"
+                        f"track_id={track.youtube_search.video_id or 'unknown'} "
+                        f"reason={fallback_reason}",
+                        exc,
                     )
             else:
                 fallback_reason = (
@@ -443,10 +475,17 @@ class LavalinkNodeBackend(AudioBackend):
                     timer.mark("direct_load_fallback_start", reason=fallback_reason)
                 try:
                     results = await player.get_tracks(query=track.youtube_search.video_url)
-                except Exception:
+                except Exception as exc:
                     if self._end_callbacks.get(guild_id) is on_end:
                         self._end_callbacks.pop(guild_id, None)
                         self._track_errors.pop(guild_id, None)
+                    log_exception(
+                        "lavalink-node direct load failed "
+                        f"guild_id={guild_id} node={node.label} "
+                        f"track_id={track.youtube_search.video_id or 'unknown'} "
+                        f"reason={fallback_reason}",
+                        exc,
+                    )
                     raise
                 tracks = self._result_tracks(results)
                 if not tracks:
@@ -457,10 +496,17 @@ class LavalinkNodeBackend(AudioBackend):
                 self._track_errors.pop(guild_id, None)
                 try:
                     await player.play(track=tracks[0])
-                except Exception:
+                except Exception as exc:
                     if self._end_callbacks.get(guild_id) is on_end:
                         self._end_callbacks.pop(guild_id, None)
                         self._track_errors.pop(guild_id, None)
+                    log_exception(
+                        "lavalink-node player play failed "
+                        f"guild_id={guild_id} node={node.label} "
+                        f"track_id={track.youtube_search.video_id or 'unknown'} "
+                        f"mode=direct_load",
+                        exc,
+                    )
                     raise
 
             if timer:

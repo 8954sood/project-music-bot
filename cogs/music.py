@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import time
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -12,7 +13,7 @@ from discord.utils import MISSING
 from core.audio import create_audio_service
 from core.audio.lavalink_node_backend import LavalinkTrackResults
 from core.audio.startup_timer import PlayStartupTimer
-from core.util import log_event
+from core.util import log_event, log_exception
 from core.local.music import MusicDataSource
 from core.local.music.model import MusicModel
 from core.model.music_application import MusicApplication
@@ -20,6 +21,11 @@ from core.network import YoutubePlaylist, YoutubeSearch
 from core.network.youtube.youtube_service import YoutubeService
 from views.music_layout import build_now_playing_view, build_idle_view
 MAX_GUILD_ACTION_PENDING = 5
+
+
+def _query_log_fields(query: str) -> str:
+    fingerprint = hashlib.sha256(query.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"query_length={len(query)} query_hash={fingerprint}"
 
 
 class SourceNotAllowed(Exception):
@@ -107,12 +113,15 @@ class Music(commands.Cog):
         from core.network.youtube.internal.youtube_utile import is_youtube_url
 
         lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
-        log_event(f"lavalink search query={lavalink_query}")
+        log_event(f"lavalink search {_query_log_fields(lavalink_query)}")
         start_time = time.monotonic()
         try:
             results = await backend._node.get_tracks(query=lavalink_query)
         except Exception as exc:
-            log_event(f"lavalink search failed: {exc}")
+            log_exception(
+                f"lavalink search failed {_query_log_fields(lavalink_query)}",
+                exc,
+            )
             raise TrackSearchFailed from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
         log_event(f"lavalink_search elapsed_ms={elapsed_ms:.1f}")
@@ -144,12 +153,15 @@ class Music(commands.Cog):
         else:
             # youtube / both 모드의 비-Spotify 입력: 기존 동작(YouTube 플레이리스트는 첫 곡만).
             lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
-        log_event(f"lavalink-node search query={lavalink_query}")
+        log_event(f"lavalink-node search {_query_log_fields(lavalink_query)}")
         start_time = time.monotonic()
         try:
             results = await backend.get_tracks(lavalink_query)
         except Exception as exc:
-            log_event(f"lavalink-node search failed: {exc}")
+            log_exception(
+                f"lavalink-node search failed {_query_log_fields(lavalink_query)}",
+                exc,
+            )
             raise TrackSearchFailed from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
         log_event(f"lavalink_node_search elapsed_ms={elapsed_ms:.1f}")
@@ -403,7 +415,7 @@ class Music(commands.Cog):
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            log_event(f"music background task failed: {exc}")
+            log_exception("music background task failed", exc)
 
     def _schedule_background(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
@@ -430,6 +442,12 @@ class Music(commands.Cog):
             try:
                 result = await self.ensure_voice_model(message)
             except Exception as exc:
+                request_id = getattr(timer, "request_id", "unknown")
+                log_exception(
+                    "voice preparation failed "
+                    f"request_id={request_id} guild_id={message.guild.id}",
+                    exc,
+                )
                 raise VoicePreparationFailed from exc
             timer.mark("voice_task_done")
             return result
@@ -793,14 +811,24 @@ class Music(commands.Cog):
             # 현재 모드에서 허용되지 않는 소스(예: youtube 모드에서 Spotify URL) → 안내 후 자동삭제.
             self._schedule_background(send_and_delete_message(str(exc)))
             return
-        except TrackSearchFailed:
+        except TrackSearchFailed as exc:
+            log_exception(
+                "music request search failed "
+                f"request_id={timer.request_id} guild_id={message.guild.id}",
+                exc,
+            )
             self._schedule_background(
                 send_and_delete_message(
                     "알 수 없는 오류로 노래를 검색하지 못했어요. 잠시 후 다시 시도해 주세요."
                 )
             )
             return
-        except VoicePreparationFailed:
+        except VoicePreparationFailed as exc:
+            log_event(
+                "music request voice failed "
+                f"request_id={timer.request_id} guild_id={message.guild.id} "
+                f"exception_type={type(exc.__cause__ or exc).__name__}"
+            )
             self._schedule_background(
                 send_and_delete_message(
                     "알 수 없는 오류로 음성 채널에 연결하지 못했어요. 잠시 후 다시 시도해 주세요."

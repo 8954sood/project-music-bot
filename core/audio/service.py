@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import CancelledError as FutureCancelledError
 import random
 import time
 from typing import Awaitable, Callable, Dict, Iterable, Optional
@@ -10,7 +11,7 @@ import discord
 from core.audio.backend import AudioBackend
 from core.audio.models import AudioState, AudioStatus
 from core.model.music_application import MusicApplication
-from core.util import log_event
+from core.util import log_event, log_exception
 from core.config import AUDIO_BACKEND
 
 
@@ -59,7 +60,13 @@ class AudioService:
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            log_event(f"audio callback failed: {exc}")
+            log_exception("audio callback failed", exc)
+
+    @staticmethod
+    def _track_log_fields(track: MusicApplication) -> str:
+        request_id = getattr(track.startup_timer, "request_id", "none")
+        video_id = track.youtube_search.video_id or "unknown"
+        return f"request_id={request_id} track_id={video_id}"
 
     def has_state(self, guild_id: int) -> bool:
         return guild_id in self.states
@@ -144,13 +151,17 @@ class AudioService:
                         state.queue.insert(0, previous)
                         log_event(
                             "playback retry scheduled "
-                            f"guild_id={guild_id} attempt={failure_count} error={playback_error}"
+                            f"guild_id={guild_id} {self._track_log_fields(previous)} "
+                            f"attempt={failure_count} queue_size={len(state.queue)} "
+                            f"exception_type={type(playback_error).__name__} error={playback_error}"
                         )
                     else:
                         self._track_failure_counts.pop(failure_key, None)
                         log_event(
                             "playback retry exhausted "
-                            f"guild_id={guild_id} attempts={failure_count} error={playback_error}"
+                            f"guild_id={guild_id} {self._track_log_fields(previous)} "
+                            f"attempts={failure_count} queue_size={len(state.queue)} "
+                            f"exception_type={type(playback_error).__name__} error={playback_error}"
                         )
                     previous = None
                     playback_error = None
@@ -202,7 +213,11 @@ class AudioService:
                     callback_task.add_done_callback(self._consume_callback_task)
                 return
             except Exception as exc:
-                log_event(f"play_next failed: {exc}")
+                log_exception(
+                    "play_next failed "
+                    f"guild_id={guild_id} {self._track_log_fields(next_track)}",
+                    exc,
+                )
                 async with self._get_lock(guild_id):
                     state = self.states.get(guild_id)
                     if state is not None and state.now_playing == next_track:
@@ -218,10 +233,24 @@ class AudioService:
 
     def _on_track_end(self, guild_id: int, previous: MusicApplication):
         def _callback(error: Optional[Exception] = None) -> None:
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self.play_next(guild_id, previous, error),
                 self.loop,
             )
+
+            def consume_result(completed) -> None:
+                try:
+                    completed.result()
+                except (asyncio.CancelledError, FutureCancelledError):
+                    pass
+                except Exception as exc:
+                    log_exception(
+                        "track end transition failed "
+                        f"guild_id={guild_id} {self._track_log_fields(previous)}",
+                        exc,
+                    )
+
+            future.add_done_callback(consume_result)
 
         return _callback
 
