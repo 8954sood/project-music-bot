@@ -10,6 +10,7 @@ from discord.ui import View
 from discord.utils import MISSING
 
 from core.audio import create_audio_service
+from core.audio.lavalink_node_backend import LavalinkTrackResults
 from core.audio.startup_timer import PlayStartupTimer
 from core.util import log_event
 from core.local.music import MusicDataSource
@@ -33,6 +34,10 @@ class TrackSearchFailed(Exception):
 
     내부 예외 상세는 로그에만 남기고 사용자에게는 일반화된 안내를 보낸다.
     """
+
+
+class VoicePreparationFailed(Exception):
+    """음성 player 준비에 실패한 경우."""
 
 
 class Music(commands.Cog):
@@ -148,10 +153,22 @@ class Music(commands.Cog):
             raise TrackSearchFailed from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
         log_event(f"lavalink_node_search elapsed_ms={elapsed_ms:.1f}")
+        if isinstance(results, LavalinkTrackResults):
+            return self._lavalink_results_to_tracks(
+                results.payload,
+                requester,
+                limit,
+                node_identifier=results.node_identifier,
+            )
         return self._lavalink_results_to_tracks(results, requester, limit)
 
     def _lavalink_results_to_tracks(
-        self, results, requester: discord.abc.User, limit: Optional[int] = None
+        self,
+        results,
+        requester: discord.abc.User,
+        limit: Optional[int] = None,
+        *,
+        node_identifier: Optional[str] = None,
     ):
         # pomice get_tracks 원시 결과(list / Playlist / 단일 / None)를 MusicApplication 리스트로 변환.
         # lavalink 와 lavalink-node 검색이 공유.
@@ -206,8 +223,6 @@ class Music(commands.Cog):
                 channel_name=author,
             )
 
-        backend = self.audio_service.backend
-        get_node_identifier = getattr(backend, "track_node_identifier", None)
         tracks_app = [
             MusicApplication(
                 youtube_search=to_youtube_search(t),
@@ -215,11 +230,7 @@ class Music(commands.Cog):
                 user_name=requester.name,
                 user_icon=requester.display_avatar.url,
                 lavalink_track=t,
-                lavalink_node_identifier=(
-                    get_node_identifier(t)
-                    if callable(get_node_identifier)
-                    else getattr(t, "_music_bot_node_identifier", None)
-                ),
+                lavalink_node_identifier=node_identifier,
             )
             for t in tracks
         ]
@@ -416,7 +427,10 @@ class Music(commands.Cog):
     ):
         async def prepare_voice():
             timer.mark("voice_task_start")
-            result = await self.ensure_voice_model(message)
+            try:
+                result = await self.ensure_voice_model(message)
+            except Exception as exc:
+                raise VoicePreparationFailed from exc
             timer.mark("voice_task_done")
             return result
 
@@ -783,6 +797,13 @@ class Music(commands.Cog):
             self._schedule_background(
                 send_and_delete_message(
                     "알 수 없는 오류로 노래를 검색하지 못했어요. 잠시 후 다시 시도해 주세요."
+                )
+            )
+            return
+        except VoicePreparationFailed:
+            self._schedule_background(
+                send_and_delete_message(
+                    "알 수 없는 오류로 음성 채널에 연결하지 못했어요. 잠시 후 다시 시도해 주세요."
                 )
             )
             return

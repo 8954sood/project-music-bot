@@ -34,12 +34,14 @@ class FakePlayer:
         *,
         fail_prepared: bool = False,
         fail_direct_load: bool = False,
+        play_hook=None,
     ) -> None:
         self.node = node
         self.guild = SimpleNamespace(id=1)
         self.is_connected = True
         self.fail_prepared = fail_prepared
         self.fail_direct_load = fail_direct_load
+        self.play_hook = play_hook
         self.get_tracks_call_count = 0
         self.get_tracks_query = None
         self.play_calls = []
@@ -54,6 +56,8 @@ class FakePlayer:
 
     async def play(self, *, track):
         self.play_calls.append(track)
+        if self.play_hook is not None:
+            await self.play_hook(self, track)
         if self.fail_prepared and len(self.play_calls) == 1:
             raise RuntimeError("prepared track rejected")
 
@@ -188,6 +192,26 @@ async def test_track_exception_is_delivered_with_load_failed_end():
 
 
 @pytest.mark.asyncio
+async def test_immediate_track_failure_is_not_lost_during_player_play():
+    target = SimpleNamespace(_identifier="node-a")
+    FakeNodePool.target = target
+    received = []
+    backend = None
+
+    async def fail_immediately(player, _track):
+        await backend._on_pomice_track_exception(player, None, "immediate failure")
+        await backend._on_pomice_track_end(player, None, "loadFailed")
+
+    player = FakePlayer(target, play_hook=fail_immediately)
+    backend = make_backend(player)
+
+    await backend.play(1, make_track(object(), "node-a"), received.append)
+
+    assert len(received) == 1
+    assert "immediate failure" in str(received[0])
+
+
+@pytest.mark.asyncio
 async def test_replaced_event_does_not_advance_queue():
     target = SimpleNamespace(_identifier="node-a")
     FakeNodePool.target = target
@@ -196,10 +220,12 @@ async def test_replaced_event_does_not_advance_queue():
     received = []
 
     await backend.play(1, make_track(object(), "node-a"), received.append)
+    backend._track_errors[1] = RuntimeError("stale error")
     await backend._on_pomice_track_end(player, None, "replaced")
 
     assert received == []
     assert 1 in backend._end_callbacks
+    assert 1 not in backend._track_errors
 
 
 def test_event_listeners_are_registered_and_removed_once():

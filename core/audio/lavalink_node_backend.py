@@ -21,6 +21,7 @@ pomice 사용 주의
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Dict, Optional, Set
 
 import discord
@@ -36,6 +37,12 @@ from core.model.music_application import MusicApplication
 from core.util import log_event
 
 
+@dataclass(frozen=True)
+class LavalinkTrackResults:
+    payload: object
+    node_identifier: str
+
+
 class LavalinkNodeBackend(AudioBackend):
     def __init__(self) -> None:
         try:
@@ -47,7 +54,6 @@ class LavalinkNodeBackend(AudioBackend):
         self._pool = LavalinkNodePool()
         self._bot: Optional[discord.Client] = None
         self._players: Dict[int, "pomice.Player"] = {}
-        self._track_nodes: Dict[int, str] = {}
         self._end_callbacks: Dict[int, OnTrackEnd] = {}
         self._track_errors: Dict[int, Exception] = {}
         self._listeners_registered = False
@@ -132,6 +138,7 @@ class LavalinkNodeBackend(AudioBackend):
             return
         normalized_reason = str(reason).lower()
         if normalized_reason == "replaced":
+            self._track_errors.pop(guild_id, None)
             return
 
         error = self._track_errors.pop(guild_id, None)
@@ -358,7 +365,7 @@ class LavalinkNodeBackend(AudioBackend):
         self._players[guild_id] = player
 
     async def get_tracks(self, query: str):
-        """검색용 loadtracks. sticky 노드부터 failover 로 시도하고 pomice 원시 결과를 반환한다.
+        """검색용 loadtracks 결과와 성공 노드 identifier를 함께 반환한다.
 
         - 결과 없음(loadType empty)은 노드 실패가 아니라 정상 응답이므로 그대로(None/빈 결과) 반환한다.
           (그렇지 않으면 매칭 없는 검색어 하나가 멀쩡한 노드를 전부 제거해버린다.)
@@ -368,8 +375,7 @@ class LavalinkNodeBackend(AudioBackend):
         async def action(node: NodeInfo):
             target = self._pomice.NodePool.get_node(identifier=node.identifier)
             results = await target.get_tracks(query=query)
-            self._tag_tracks_with_node(results, node.identifier)
-            return results
+            return LavalinkTrackResults(results, node.identifier)
 
         return await self._pool.run_with_failover(action)
 
@@ -382,19 +388,6 @@ class LavalinkNodeBackend(AudioBackend):
         if hasattr(results, "tracks"):
             return list(results.tracks)
         return [results]
-
-    def _tag_tracks_with_node(self, results, node_identifier: str) -> None:
-        for track in self._result_tracks(results):
-            self._track_nodes[id(track)] = node_identifier
-            try:
-                setattr(track, "_music_bot_node_identifier", node_identifier)
-            except (AttributeError, TypeError):
-                pass
-
-    def track_node_identifier(self, track) -> Optional[str]:
-        tagged = getattr(track, "_music_bot_node_identifier", None)
-        stored = self._track_nodes.pop(id(track), None)
-        return tagged or stored
 
     async def play(self, guild_id: int, track: MusicApplication, on_end: OnTrackEnd) -> None:
         player = self._players.get(guild_id)
@@ -413,6 +406,8 @@ class LavalinkNodeBackend(AudioBackend):
             fallback_reason = None
 
             if prepared is not None and same_node:
+                self._end_callbacks[guild_id] = on_end
+                self._track_errors.pop(guild_id, None)
                 try:
                     if timer:
                         timer.mark("backend_play_start", node=node.identifier)
@@ -423,6 +418,9 @@ class LavalinkNodeBackend(AudioBackend):
                     )
                     await player.play(track=prepared)
                 except Exception as exc:
+                    if self._end_callbacks.get(guild_id) is on_end:
+                        self._end_callbacks.pop(guild_id, None)
+                        self._track_errors.pop(guild_id, None)
                     fallback_reason = "prepared_track_failed"
                     log_event(
                         "lavalink-node play fallback direct load "
@@ -443,16 +441,28 @@ class LavalinkNodeBackend(AudioBackend):
             if fallback_reason is not None:
                 if timer:
                     timer.mark("direct_load_fallback_start", reason=fallback_reason)
-                results = await player.get_tracks(query=track.youtube_search.video_url)
+                try:
+                    results = await player.get_tracks(query=track.youtube_search.video_url)
+                except Exception:
+                    if self._end_callbacks.get(guild_id) is on_end:
+                        self._end_callbacks.pop(guild_id, None)
+                        self._track_errors.pop(guild_id, None)
+                    raise
                 tracks = self._result_tracks(results)
                 if not tracks:
                     raise RuntimeError("노드가 트랙을 찾지 못함")
                 if timer:
                     timer.mark("direct_load_fallback_done", reason=fallback_reason)
-                await player.play(track=tracks[0])
+                self._end_callbacks[guild_id] = on_end
+                self._track_errors.pop(guild_id, None)
+                try:
+                    await player.play(track=tracks[0])
+                except Exception:
+                    if self._end_callbacks.get(guild_id) is on_end:
+                        self._end_callbacks.pop(guild_id, None)
+                        self._track_errors.pop(guild_id, None)
+                    raise
 
-            self._end_callbacks[guild_id] = on_end
-            self._track_errors.pop(guild_id, None)
             if timer:
                 timer.mark("backend_play_done", node=node.identifier)
             log_event(

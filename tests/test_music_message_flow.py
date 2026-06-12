@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 import cogs.music as music_module
-from cogs.music import Music, SourceNotAllowed, TrackSearchFailed
+from cogs.music import (
+    Music,
+    SourceNotAllowed,
+    TrackSearchFailed,
+    VoicePreparationFailed,
+)
+from core.audio.lavalink_node_backend import LavalinkTrackResults
 from core.audio.service import AudioService
 from core.audio.startup_timer import PlayStartupTimer
 from core.model.music_application import MusicApplication
@@ -72,11 +77,10 @@ def make_music(backend=None):
 
 def test_lavalink_mapping_preserves_original_track_and_metadata():
     original = FakeTrack()
-    backend = SimpleNamespace(track_node_identifier=lambda track: "node-a")
-    music = make_music(backend)
+    music = make_music()
 
     tracks, title, count = music._lavalink_results_to_tracks(
-        [original], requester(), limit=1
+        [original], requester(), limit=1, node_identifier="node-a"
     )
 
     assert title is None
@@ -123,28 +127,31 @@ def test_lavalink_mapping_preserves_tracks_for_all_result_shapes(
 @pytest.mark.asyncio
 async def test_prepare_voice_and_search_runs_concurrently():
     music = make_music()
-    starts = {}
+    voice_started = asyncio.Event()
+    search_started = asyncio.Event()
+    release = asyncio.Event()
 
     async def ensure_voice(_message):
-        starts["voice"] = time.monotonic()
-        await asyncio.sleep(0.1)
+        voice_started.set()
+        await release.wait()
         return object()
 
     async def search(*_args, **_kwargs):
-        starts["search"] = time.monotonic()
-        await asyncio.sleep(0.1)
+        search_started.set()
+        await release.wait()
         return [application_track()], None, None
 
     music.ensure_voice_model = ensure_voice
     music._search_tracks = search
     message = SimpleNamespace(content="query", author=requester())
 
-    started = time.monotonic()
-    await music._prepare_voice_and_tracks(message, FakeTimer())
-    elapsed = time.monotonic() - started
+    task = asyncio.create_task(music._prepare_voice_and_tracks(message, FakeTimer()))
+    await asyncio.wait_for(voice_started.wait(), timeout=0.1)
+    await asyncio.wait_for(search_started.wait(), timeout=0.1)
+    assert not task.done()
 
-    assert abs(starts["voice"] - starts["search"]) < 0.03
-    assert elapsed < 0.17
+    release.set()
+    await task
 
 
 @pytest.mark.asyncio
@@ -176,6 +183,7 @@ async def test_search_error_cancels_voice_task():
 @pytest.mark.asyncio
 async def test_on_message_keeps_background_work_off_critical_path():
     events = []
+    release_background = asyncio.Event()
     track = application_track()
     voice_channel = SimpleNamespace(id=9)
     author = requester()
@@ -186,7 +194,7 @@ async def test_on_message_keeps_background_work_off_critical_path():
         id = 77
 
         async def send(self, *_args, **_kwargs):
-            await asyncio.sleep(0.2)
+            await release_background.wait()
             events.append("sent")
 
     class FakeMessage:
@@ -198,7 +206,7 @@ async def test_on_message_keeps_background_work_off_critical_path():
             self.author = author
 
         async def delete(self, *, delay):
-            await asyncio.sleep(0.2)
+            await release_background.wait()
             events.append(("deleted", delay))
 
     class FakeBot:
@@ -226,16 +234,14 @@ async def test_on_message_keeps_background_work_off_critical_path():
 
     music.ensure_voice_model = ensure_voice
     music._search_tracks = search
-    started = time.monotonic()
     await Music.on_message(music, FakeMessage())
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 0.17
     assert "played" in events
     assert "sent" not in events
     assert not any(isinstance(event, tuple) and event[0] == "deleted" for event in events)
 
-    await asyncio.sleep(0.22)
+    release_background.set()
+    await asyncio.sleep(0)
     assert "sent" in events
     assert ("deleted", 5) in events
 
@@ -292,6 +298,26 @@ async def test_lavalink_node_search_failure_is_not_treated_as_empty_results():
 
     with pytest.raises(TrackSearchFailed):
         await music._search_tracks_lavalink_node("query", requester(), limit=1)
+
+
+@pytest.mark.asyncio
+async def test_lavalink_node_search_result_carries_node_identifier():
+    original = FakeTrack()
+    backend = SimpleNamespace(
+        get_tracks=AsyncMock(
+            return_value=LavalinkTrackResults([original], "node-a")
+        )
+    )
+    music = make_music(backend)
+
+    tracks, _, _ = await music._search_tracks_lavalink_node(
+        "query",
+        requester(),
+        limit=1,
+    )
+
+    assert tracks[0].lavalink_track is original
+    assert tracks[0].lavalink_node_identifier == "node-a"
 
 
 @pytest.mark.asyncio
@@ -358,6 +384,53 @@ async def test_on_message_reports_unknown_error_for_search_failure():
 
 
 @pytest.mark.asyncio
+async def test_on_message_reports_unknown_error_for_voice_failure():
+    sent_messages = []
+    voice_channel = SimpleNamespace(id=9)
+    author = requester()
+    author.bot = False
+    author.voice = SimpleNamespace(channel=voice_channel)
+
+    class FakeChannel:
+        id = 77
+
+        async def send(self, content, **_kwargs):
+            sent_messages.append(content)
+
+    class FakeMessage:
+        content = "query"
+        guild = SimpleNamespace(id=1)
+        channel = FakeChannel()
+
+        def __init__(self):
+            self.author = author
+
+        async def delete(self, *, delay):
+            return None
+
+    music = make_music()
+    music.bot = SimpleNamespace(process_commands=lambda _message: asyncio.sleep(0))
+    music.audio_service = SimpleNamespace(states={})
+    music.guild_channel_ids = lambda: [77]
+
+    async def failed_voice(_message):
+        raise RuntimeError("voice connect failed")
+
+    async def search(*_args, **_kwargs):
+        await asyncio.sleep(10)
+
+    music.ensure_voice_model = failed_voice
+    music._search_tracks = search
+
+    await Music.on_message(music, FakeMessage())
+    await asyncio.sleep(0)
+
+    assert sent_messages == [
+        "알 수 없는 오류로 음성 채널에 연결하지 못했어요. 잠시 후 다시 시도해 주세요."
+    ]
+
+
+@pytest.mark.asyncio
 async def test_now_playing_refresh_callback_does_not_block_playback_start():
     callback_finished = asyncio.Event()
 
@@ -382,11 +455,8 @@ async def test_now_playing_refresh_callback_does_not_block_playback_start():
     )
     voice_channel = SimpleNamespace(id=9)
 
-    started = time.monotonic()
     await service.enqueue_and_play(1, voice_channel, [application_track()])
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 0.05
     assert not callback_finished.is_set()
 
     await asyncio.wait_for(callback_finished.wait(), timeout=0.3)
