@@ -27,6 +27,14 @@ class SourceNotAllowed(Exception):
     메시지(str)는 사용자에게 그대로 노출되며, 호출부(on_message)에서 자동삭제 안내로 처리한다.
     """
 
+
+class TrackSearchFailed(Exception):
+    """Lavalink 검색 요청 자체가 실패한 경우.
+
+    내부 예외 상세는 로그에만 남기고 사용자에게는 일반화된 안내를 보낸다.
+    """
+
+
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -89,14 +97,18 @@ class Music(commands.Cog):
         backend = self.audio_service.backend
         if not hasattr(backend, "_node") or backend._node is None:
             log_event("lavalink search skipped: backend._node is None")
-            return [], None, None
+            raise TrackSearchFailed
 
         from core.network.youtube.internal.youtube_utile import is_youtube_url
 
         lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
         log_event(f"lavalink search query={lavalink_query}")
         start_time = time.monotonic()
-        results = await backend._node.get_tracks(query=lavalink_query)
+        try:
+            results = await backend._node.get_tracks(query=lavalink_query)
+        except Exception as exc:
+            log_event(f"lavalink search failed: {exc}")
+            raise TrackSearchFailed from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
         log_event(f"lavalink_search elapsed_ms={elapsed_ms:.1f}")
         return self._lavalink_results_to_tracks(results, requester, limit)
@@ -132,9 +144,8 @@ class Music(commands.Cog):
         try:
             results = await backend.get_tracks(lavalink_query)
         except Exception as exc:
-            # 사용 가능한 노드가 없거나 전부 실패 → 빈 결과로 처리.
             log_event(f"lavalink-node search failed: {exc}")
-            return [], None, None
+            raise TrackSearchFailed from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
         log_event(f"lavalink_node_search elapsed_ms={elapsed_ms:.1f}")
         return self._lavalink_results_to_tracks(results, requester, limit)
@@ -767,6 +778,13 @@ class Music(commands.Cog):
         except SourceNotAllowed as exc:
             # 현재 모드에서 허용되지 않는 소스(예: youtube 모드에서 Spotify URL) → 안내 후 자동삭제.
             self._schedule_background(send_and_delete_message(str(exc)))
+            return
+        except TrackSearchFailed:
+            self._schedule_background(
+                send_and_delete_message(
+                    "알 수 없는 오류로 노래를 검색하지 못했어요. 잠시 후 다시 시도해 주세요."
+                )
+            )
             return
 
         if not tracks:

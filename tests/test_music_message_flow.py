@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import cogs.music as music_module
-from cogs.music import Music, SourceNotAllowed
+from cogs.music import Music, SourceNotAllowed, TrackSearchFailed
 from core.audio.service import AudioService
 from core.audio.startup_timer import PlayStartupTimer
 from core.model.music_application import MusicApplication
@@ -281,6 +281,80 @@ async def test_no_search_results_do_not_enqueue():
     await asyncio.sleep(0)
 
     assert enqueue_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_lavalink_node_search_failure_is_not_treated_as_empty_results():
+    backend = SimpleNamespace(
+        get_tracks=AsyncMock(side_effect=RuntimeError("all clients failed"))
+    )
+    music = make_music(backend)
+
+    with pytest.raises(TrackSearchFailed):
+        await music._search_tracks_lavalink_node("query", requester(), limit=1)
+
+
+@pytest.mark.asyncio
+async def test_lavalink_search_failure_is_not_treated_as_empty_results():
+    backend = SimpleNamespace(
+        _node=SimpleNamespace(
+            get_tracks=AsyncMock(side_effect=RuntimeError("all clients failed"))
+        )
+    )
+    music = make_music(backend)
+
+    with pytest.raises(TrackSearchFailed):
+        await music._search_tracks_lavalink("query", requester(), limit=1)
+
+
+@pytest.mark.asyncio
+async def test_on_message_reports_unknown_error_for_search_failure():
+    sent_messages = []
+    voice_channel = SimpleNamespace(id=9)
+    author = requester()
+    author.bot = False
+    author.voice = SimpleNamespace(channel=voice_channel)
+
+    class FakeChannel:
+        id = 77
+
+        async def send(self, content, **_kwargs):
+            sent_messages.append(content)
+
+    class FakeMessage:
+        content = "query"
+        guild = SimpleNamespace(id=1)
+        channel = FakeChannel()
+
+        def __init__(self):
+            self.author = author
+
+        async def delete(self, *, delay):
+            return None
+
+    class FakeAudioService:
+        states = {}
+
+        async def enqueue_and_play(self, *_args):
+            raise AssertionError("search failure must not enqueue")
+
+    music = make_music()
+    music.bot = SimpleNamespace(process_commands=lambda _message: asyncio.sleep(0))
+    music.audio_service = FakeAudioService()
+    music.guild_channel_ids = lambda: [77]
+    music.ensure_voice_model = lambda _message: asyncio.sleep(0)
+
+    async def failed_search(*_args, **_kwargs):
+        raise TrackSearchFailed
+
+    music._search_tracks = failed_search
+
+    await Music.on_message(music, FakeMessage())
+    await asyncio.sleep(0)
+
+    assert sent_messages == [
+        "알 수 없는 오류로 노래를 검색하지 못했어요. 잠시 후 다시 시도해 주세요."
+    ]
 
 
 @pytest.mark.asyncio
