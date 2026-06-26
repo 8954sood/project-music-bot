@@ -1,4 +1,5 @@
 import re
+from urllib.parse import parse_qs, urlparse
 from typing import Optional
 
 
@@ -10,9 +11,18 @@ def is_youtube_url(text: str) -> bool:
     return re.match(pattern, text) is not None
 
 def is_playlist_url(url: str) -> bool:
-    # YouTube 플레이리스트 URL 정규식
-    pattern = re.compile(r'youtube\.com/playlist\?list=[^&]+', re.IGNORECASE)
-    return re.search(pattern, url) is not None
+    if not is_youtube_url(url):
+        return False
+
+    parsed = urlparse(url if re.match(r"^https?://", url, re.IGNORECASE) else f"https://{url}")
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+        return False
+
+    query = parse_qs(parsed.query)
+    return parsed.path == "/playlist" and bool(query.get("list", [""])[0])
 
 
 def get_song_url(url: str) -> Optional[str]:

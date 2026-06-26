@@ -110,9 +110,11 @@ class Music(commands.Cog):
             log_event("lavalink search skipped: backend._node is None")
             raise TrackSearchFailed
 
-        from core.network.youtube.internal.youtube_utile import is_youtube_url
+        from core.network.youtube.internal.youtube_utile import is_playlist_url, is_youtube_url
 
         lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
+        if is_playlist_url(query):
+            limit = None
         log_event(f"lavalink search {_query_log_fields(lavalink_query)}")
         start_time = time.monotonic()
         try:
@@ -134,7 +136,7 @@ class Music(commands.Cog):
         # ffmpeg 와 달리 yt-dlp/cookies.txt 가 필요 없다.
         backend = self.audio_service.backend
         from core.config import LAVALINK_NODE_SOURCE
-        from core.network.youtube.internal.youtube_utile import is_youtube_url
+        from core.network.youtube.internal.youtube_utile import is_playlist_url, is_youtube_url
         from core.util import is_spotify_url, is_spotify_collection_url
 
         # LAVALINK_NODE_SOURCE 모드 + 링크 판별로 분기. Spotify 는 URL 일 때만 재생되며,
@@ -151,8 +153,10 @@ class Music(commands.Cog):
                 raise SourceNotAllowed("유튜브는 현재 모드에서 제공할 수 없습니다.")
             raise SourceNotAllowed("현재 모드에서는 Spotify 링크만 재생할 수 있어요.")
         else:
-            # youtube / both 모드의 비-Spotify 입력: 기존 동작(YouTube 플레이리스트는 첫 곡만).
+            # youtube / both 모드의 비-Spotify 입력: URL 은 원본 그대로, 일반 검색어만 ytsearch.
             lavalink_query = query if is_youtube_url(query) else f"ytsearch:{query}"
+            if is_playlist_url(query):
+                limit = None
         log_event(f"lavalink-node search {_query_log_fields(lavalink_query)}")
         start_time = time.monotonic()
         try:
@@ -189,7 +193,14 @@ class Music(commands.Cog):
 
         playlist_title = None
         playlist_count = None
-        if isinstance(results, list):
+        if isinstance(results, dict):
+            payload = results.get("data") if isinstance(results.get("data"), dict) else results
+            tracks = payload.get("tracks") or []
+            playlist_info = payload.get("playlistInfo") or payload.get("info") or {}
+            if isinstance(playlist_info, dict):
+                playlist_title = playlist_info.get("name") or playlist_info.get("title")
+            playlist_count = len(tracks)
+        elif isinstance(results, list):
             tracks = results
         elif hasattr(results, "tracks"):
             tracks = list(results.tracks)
@@ -202,21 +213,29 @@ class Music(commands.Cog):
             tracks = [results]
 
         if not tracks:
-            return [], None, None
+            return [], playlist_title, playlist_count
         if limit is not None and limit > 0:
             tracks = tracks[:limit]
 
         def to_youtube_search(track) -> YoutubeSearch:
-            title = getattr(track, "title", "Unknown")
-            uri = getattr(track, "uri", "") or ""
-            identifier = getattr(track, "identifier", "") or ""
-            duration = getattr(track, "length", 0) or 0
-            author = getattr(track, "author", "") or ""
+            if isinstance(track, dict):
+                info = track.get("info") or {}
+                title = info.get("title") or "Unknown"
+                uri = info.get("uri") or ""
+                identifier = info.get("identifier") or ""
+                duration = info.get("length") or 0
+                author = info.get("author") or ""
+            else:
+                title = getattr(track, "title", "Unknown")
+                uri = getattr(track, "uri", "") or ""
+                identifier = getattr(track, "identifier", "") or ""
+                duration = getattr(track, "length", 0) or 0
+                author = getattr(track, "author", "") or ""
+                info = getattr(track, "info", None) or {}
             # pomice 의 thumbnail(YouTube 만 채워짐) → 없으면 원본 loadtracks info 의 artworkUrl
             # (Spotify/LavaSrc 는 앨범 아트를 artworkUrl 로 주고 pomice 는 thumbnail 로 안 읽음).
-            info = getattr(track, "info", None) or {}
             source = info.get("sourceName")
-            thumbnail = getattr(track, "thumbnail", None) or info.get("artworkUrl")
+            thumbnail = (None if isinstance(track, dict) else getattr(track, "thumbnail", None)) or info.get("artworkUrl")
             # 마지막 fallback(video id 로 YouTube 썸네일 추정)은 YouTube 소스에만 적용
             # (Spotify identifier 로 만들면 깨진 URL 이 된다).
             if not thumbnail and identifier and source in (None, "youtube"):
@@ -454,7 +473,10 @@ class Music(commands.Cog):
 
         async def search_tracks():
             timer.mark("search_task_start", query_length=len(message.content))
-            result = await self._search_tracks(message.content, message.author, limit=1)
+            from core.network.youtube.internal.youtube_utile import is_playlist_url
+
+            limit = None if is_playlist_url(message.content) else 1
+            result = await self._search_tracks(message.content, message.author, limit=limit)
             timer.mark("search_task_done")
             return result
 
